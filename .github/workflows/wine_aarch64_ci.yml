@@ -1,0 +1,155 @@
+name: Wine-aarch64 FEX CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-wow64-fex:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3 \
+            curl \
+            tar \
+            xz-utils \
+            xvfb \
+            libpulse0 \
+            libasound2t64 \
+            libgl1 \
+            libvulkan1
+
+      - name: Install llvm-mingw toolchain (aarch64)
+        run: |
+          # LLVM_MINGW_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20240917/llvm-mingw-20240917-ucrt-ubuntu-22.04-aarch64.tar.xz"
+          LLVM_MINGW_URL="https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-aarch64.tar.xz"
+          mkdir -p /opt/llvm-mingw
+          curl -sSL "$LLVM_MINGW_URL" | tar -xJ -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> $GITHUB_PATH
+
+      - name: Compile hello32.exe and hello64.exe
+        run: |
+          cat << 'EOF' > hello.c
+          #include <windows.h>
+          #include <stdio.h>
+
+          int main(void) {
+              printf("Hello World!\n");
+              return 0;
+          }
+          EOF
+
+          i686-w64-mingw32-clang -O2 hello.c -o hello32.exe
+          x86_64-w64-mingw32-clang -O2 hello.c -o hello64.exe
+
+      - name: Fetch and unpack DroidDeck-Proton 11-11.9 (arm64-glibc builds as opposed to Android bionic ones)
+        run: |
+          PROTON_URL="https://github.com/Droid-Deck/DroidDeck-Proton/releases/download/DroidDeck-Proton-11-11.9/DroidDeck-Proton-11-11.9-aarch64.tar.gz"
+          mkdir -p /opt/droiddeck-proton
+          curl -sSL "$PROTON_URL" | tar -xz -C /opt/droiddeck-proton --strip-components=1
+
+      - name: Build FEX wow64 plugin
+        run: |
+          cmake -S . -B build_wow64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=aarch64-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False \
+            -DTUNE_ARCH=generic \
+            -DTUNE_CPU=none \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_wow64
+          DESTDIR="$PWD/install_fex" cmake --build build_wow64 -t install
+
+      - name: Build FEX wow64 UnixLib (.so)
+        run: |
+          cmake -S Source/Windows/UnixLib -B build_unixlib_wow64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-unix \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build_unixlib_wow64
+          DESTDIR="$PWD/install_fex" cmake --build build_unixlib_wow64 -t install
+
+      - name: Build FEX arm64ec plugin
+        run: |
+          cmake -S . -B build_arm64ec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False \
+            -DTUNE_ARCH=generic \
+            -DTUNE_CPU=none \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_arm64ec
+          DESTDIR="$PWD/install_fex" cmake --build build_arm64ec -t install
+
+      - name: Build FEX arm64ec UnixLib (.so)
+        run: |
+          cmake -S Source/Windows/UnixLib -B build_unixlib_arm64ec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-unix \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build_unixlib_arm64ec
+          DESTDIR="$PWD/install_fex" cmake --build build_unixlib_arm64ec -t install
+
+      - name: Install FEX plugins into DroidDeck-Proton
+        run: |
+          WIN_DIR="/opt/droiddeck-proton/files/lib/wine/aarch64-windows"
+          UNIX_DIR="/opt/droiddeck-proton/files/lib/wine/aarch64-unix"
+
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libwow64fex.dll "$WIN_DIR/libwow64fex.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-unix/libwow64fex.so "$UNIX_DIR/libwow64fex.so"
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libwow64fex.dll "$WIN_DIR/wow64cpu.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libarm64ecfex.dll "$WIN_DIR/libarm64ecfex.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-unix/libarm64ecfex.so "$UNIX_DIR/libarm64ecfex.so"
+
+      - name: Run hello32.exe
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+        run: |
+          xvfb-run -a wine hello32.exe
+
+      - name: Run hello64.exe
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+        run: |
+          xvfb-run -a wine hello64.exe
+
+      - name: Upload libraries
+        uses: actions/upload-artifact@v6
+        timeout-minutes: 1
+        with:
+          overwrite: true
+          name: wine_dll_artifacts
+          path: |
+            ${{ github.workspace }}/hello32.exe
+            ${{ github.workspace }}/hello64.exe
+          retention-days: 60
+          compression-level: 9
