@@ -63,9 +63,13 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
       if (EffectiveRWX) {
         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
         RWXIntervals.Insert(ProtInterval);
+      } else {
+        RWXIntervals.Remove(ProtInterval);
       }
       if (DEPDisabled && !HasExec) {
         DEPPromotedIntervals.Insert(ProtInterval);
+      } else {
+        DEPPromotedIntervals.Remove(ProtInterval);
       }
       return true;
     } else if (XIntervals.Intersect(ProtInterval)) {
@@ -193,6 +197,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
     LogMan::Msg::DFmt("InvalidateContainingSection: {:X} - {:X}", SectionBase, SectionBase + SectionSize);
+    DEPPromotedIntervals.Remove({SectionBase, SectionBase + SectionSize});
   }
 
   return {SectionBase, SectionSize};
@@ -214,6 +219,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     LogMan::Msg::DFmt("InvalidateAlignedInterval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+    DEPPromotedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }
 }
 
