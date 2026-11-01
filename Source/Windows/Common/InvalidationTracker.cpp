@@ -56,6 +56,8 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
 
+    LogMan::Msg::DFmt("HandleMemoryProtectionNotification: {:X} - {:X} to {:X}", AlignedBase, AlignedBase + AlignedSize, Prot);
+    LogMan::Msg::DFmt("    HasExec: {:X}, DEPDisabled: {:X}, EffectiveExec: {:X}, EffectiveRWX: {:X}", HasExec, DEPDisabled, EffectiveExec, EffectiveRWX);
     if (EffectiveExec) {
       XIntervals.Insert(ProtInterval);
       if (EffectiveRWX) {
@@ -85,6 +87,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
 }
 
 void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
+  LogMan::Msg::DFmt("HandleProcessExecuteFlagsChange: {:X}", Flags);
   const bool DisableDEP = (Flags & MEM_EXECUTE_OPTION_ENABLE) != 0;
 
   std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
@@ -189,6 +192,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    LogMan::Msg::DFmt("InvalidateContainingSection: {:X} - {:X}", SectionBase, SectionBase + SectionSize);
   }
 
   return {SectionBase, SectionSize};
@@ -209,10 +213,12 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    LogMan::Msg::DFmt("InvalidateAlignedInterval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
   }
 }
 
 void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size) {
+  LogMan::Msg::DFmt("ReprotectRWXIntervals: {:X} - {:X}", Address, Address + Size);
   ProtectRWXIntervalsInternal(Address, Size, false);
 }
 
@@ -349,6 +355,9 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
   bool HitRWXInterval = false;
   do {
     const auto Query = RWXIntervals.Query(Address);
+    LogMan::Msg::DFmt("ProtectRWXIntervalsInternal: {:X} - {:X}, ForWriteLocked: {:X}", Address, End, ForWriteLocked);
+    LogMan::Msg::DFmt("  RWXIntervals.Query(Address) - Enclosed: {:X}, Size: {:X}, HitRWXInterval: {:X}", Query.Enclosed, Query.Size, HitRWXInterval);
+
     if (Query.Enclosed) {
       if (!HitRWXInterval) {
         if (ForWriteLocked) {

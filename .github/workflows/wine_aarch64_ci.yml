@@ -55,6 +55,69 @@ jobs:
           i686-w64-mingw32-clang -O2 hello.c -o hello32.exe
           x86_64-w64-mingw32-clang -O2 hello.c -o hello64.exe
 
+      - name: Compile 32-bit test_dll.dll and test_dll_main.exe
+        run: |
+          cat << 'EOF' > test_dll.c
+          #include <windows.h>
+
+          __declspec(dllexport) int TargetFunction(void) {
+              static const int value = 42;
+              return value;
+          }
+
+          BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+              return TRUE;
+          }
+          EOF
+
+          cat << 'EOF' > test_dll_main.c
+          #include <windows.h>
+          #include <stdio.h>
+
+          #define PAGE_EXECUTE_FLAGS \
+              (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+
+          int main(void) {
+              printf("Loading relocated test_dll.dll\n");
+              HMODULE hDll = LoadLibraryA("test_dll.dll");
+              printf("test_dll.dll loaded at: %p\n", (void *)hDll);
+
+              typedef int (*fnTarget)(void);
+              fnTarget pTarget = (fnTarget)GetProcAddress(hDll, "TargetFunction");
+              printf("TargetFunction located at: %p\n", (void *)pTarget);
+
+              MEMORY_BASIC_INFORMATION mbi;
+              #define LOG_PROTECTION(pTarget, mbi) \
+                  VirtualQuery((void *)pTarget, &mbi, sizeof(MEMORY_BASIC_INFORMATION)); \
+                  printf("test_dll.dll .text protectection is %s: 0x%08lX, expecting 0x%08lX (PAGE_EXECUTE_READ)\n", \
+                         mbi.Protect == PAGE_EXECUTE_READ ? "CORRECT" : "WRONG", \
+                         mbi.Protect, \
+                         (unsigned long)PAGE_EXECUTE_READ)
+
+              DWORD old_prot;
+              // turn the page RW and then XR to set the tracking ranges in InvalidationTracker
+              VirtualProtect((void *)pTarget, 4096, PAGE_READWRITE, &old_prot);
+              VirtualProtect((void *)pTarget, 4096, PAGE_EXECUTE_READ, &old_prot);
+
+              // LOG_PROTECTION(pTarget, mbi); // resets the page eagerly (does not trigger bug)
+
+              printf("Calling TargetFunction...\n");
+              int result = pTarget(); // triggers ReprotectRWXIntervals lazily (triggers the bug)
+              printf("TargetFunction(): %d (expected 42)\n", result);
+
+              LOG_PROTECTION(pTarget, mbi);
+
+              FreeLibrary(hDll);
+              return (mbi.Protect == PAGE_EXECUTE_READ) ? 0 : 2;
+          }
+          EOF
+
+          i686-w64-mingw32-clang -shared -O2 test_dll.c \
+              -Wl,--image-base,0x10000 -Wl,--disable-nxcompat -o test_dll.dll
+
+          i686-w64-mingw32-clang -O2 test_dll_main.c \
+              -Wl,--disable-nxcompat -o test_dll_main.exe
+
       - name: Fetch and unpack DroidDeck-Proton 11-11.9 (arm64-glibc builds as opposed to Android bionic ones)
         run: |
           PROTON_URL="https://github.com/Droid-Deck/DroidDeck-Proton/releases/download/DroidDeck-Proton-11-11.9/DroidDeck-Proton-11-11.9-aarch64.tar.gz"
@@ -126,6 +189,20 @@ jobs:
           cp -fv install_fex/usr/lib/wine/aarch64-windows/libarm64ecfex.dll "$WIN_DIR/libarm64ecfex.dll"
           cp -fv install_fex/usr/lib/wine/aarch64-unix/libarm64ecfex.so "$UNIX_DIR/libarm64ecfex.so"
 
+      - name: Upload libraries
+        uses: actions/upload-artifact@v6
+        timeout-minutes: 1
+        with:
+          overwrite: true
+          name: wine_dll_artifacts
+          path: |
+            ${{ github.workspace }}/hello32.exe
+            ${{ github.workspace }}/hello64.exe
+            ${{ github.workspace }}/test_dll_main.exe
+            ${{ github.workspace }}/test_dll.dll
+          retention-days: 60
+          compression-level: 9
+
       - name: Run hello32.exe
         env:
           WINEPREFIX: ${{ github.workspace }}/wineprefix
@@ -142,14 +219,12 @@ jobs:
         run: |
           xvfb-run -a wine hello64.exe
 
-      - name: Upload libraries
-        uses: actions/upload-artifact@v6
-        timeout-minutes: 1
-        with:
-          overwrite: true
-          name: wine_dll_artifacts
-          path: |
-            ${{ github.workspace }}/hello32.exe
-            ${{ github.workspace }}/hello64.exe
-          retention-days: 60
-          compression-level: 9
+      - name: Run test_dll_main.exe
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          xvfb-run -a wine test_dll_main.exe
