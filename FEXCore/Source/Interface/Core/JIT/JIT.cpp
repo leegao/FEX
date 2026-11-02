@@ -602,7 +602,11 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
   } else {
     // This case is common between calls and jumps as the thunk callsite can be left untouched.
+#ifdef __clang__
     std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
+#else
+    __atomic_store_n(&Record->HostCode, HostCode, __ATOMIC_SEQ_CST);
+#endif
 #ifdef ARCHITECTURE_arm64
     // Make memory write visible to other threads reading the same location
     asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);

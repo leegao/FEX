@@ -13,3 +13,15 @@ out/
 .cache
 .idea/
 CMakeLists.txt.user
+fex-arm64ec-sdk
+test-pfx/
+assets/
+archives/
+aot_out/
+archive.zip
+external.zip
+include.zip
+llvm.zip
+*.patch
+*.diff
+*.log

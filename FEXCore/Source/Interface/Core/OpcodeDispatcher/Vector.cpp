@@ -5666,7 +5666,7 @@ void OpDispatchBuilder::PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask
 
   Ref Src1HasInvalidElements = Select01(OpSize::i32Bit, CondClass::ULT, Src1Length, Constant(NumElements));
   Ref Src2HasInvalidElements = Select01(OpSize::i32Bit, CondClass::ULT, Src2Length, Constant(NumElements));
-  Ref Src2ValidElementsMask = NeedsSrc2ValidElements ? _VCMPGT(OpSize::i128Bit, ElementSize, Src2LengthVector, Indices) : nullptr;
+  Ref Src2ValidElementsMask = NeedsSrc2ValidElements ? static_cast<Ref>(_VCMPGT(OpSize::i128Bit, ElementSize, Src2LengthVector, Indices)) : nullptr;
 
   // Perform the aggregation operations, see section 4.1.3 in the Intel SDM.
   Ref Matches {};

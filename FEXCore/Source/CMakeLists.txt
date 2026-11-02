@@ -49,6 +49,8 @@ set(SRCS
   Interface/Core/JIT/MoveOps.cpp
   Interface/Core/JIT/VectorOps.cpp
   Interface/Core/JIT/Arm64Relocations.cpp
+  Interface/Core/AOT/LLVMArm64ECAOT.cpp
+  Interface/Core/AOT/PECOFFContainer.cpp
   Interface/Core/X86Tables/BaseTables.cpp
   Interface/Core/X86Tables/DDDTables.cpp
   Interface/Core/X86Tables/H0F38Tables.cpp

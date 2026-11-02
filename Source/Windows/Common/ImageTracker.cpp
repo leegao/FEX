@@ -1,3 +1,4 @@
+#include <FEXCore/Core/LLVMArm64ECAOT.h>
 // SPDX-License-Identifier: MIT
 
 #include <array>
@@ -172,9 +173,8 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
         CTX.SetCodeMapWriter(std::move(Writer));
       }
     }
-    if (!ActiveCodeMapPath.empty()) {
-      LoadAOTImages(*ImageInfo);
-    }
+    // Always attempt per-binary AOT cache loading for every mapped PE image (.exe and .dll)
+    LoadAOTImages(*ImageInfo);
 
     auto AOTImage = AOTImages.find(ID);
     if (AOTImage != AOTImages.end() && AOTImage->second.CacheFile) {
@@ -234,17 +234,42 @@ void ImageTracker::LoadAOTImages(MappedImageInfo& ImageInfo) {
   }
 
   auto ID = FEXCore::CodeMap::GetBaseFilename(ImageInfo.Info, false);
-  const uint64_t CodeCacheConfigId = 0; // TODO
-  const auto AnsiPath = fmt::format("\\??\\{}cache\\{}-{:016x}", FEX::Config::GetCacheDirectory(), ID, CodeCacheConfigId);
+  const uint64_t CodeCacheConfigId = FEXCore::AOT::ComputeCodeCacheConfigId(nullptr, true);
+  // Probe per-binary Dual PE/COFF Arm64EC (.aot.dll) container first, falling back to extensionless or .fxcc
+  const auto BasePath = fmt::format("\\??\\{}cache\\{}-{:016x}", FEX::Config::GetCacheDirectory(), ID, CodeCacheConfigId);
+  const auto BaseZero = fmt::format("\\??\\{}cache\\{}-0000000000000000", FEX::Config::GetCacheDirectory(), ID);
+  const auto BasePlain = fmt::format("\\??\\{}cache\\{}", FEX::Config::GetCacheDirectory(), ID);
+
+  const std::string Candidates[] = {
+    BasePath + ".aot.dll",
+    BasePath + ".fxcc",
+    BasePath,
+    BaseZero + ".aot.dll",
+    BaseZero + ".fxcc",
+    BaseZero,
+    BasePlain + ".aot.dll",
+    BasePlain + ".fxcc",
+    BasePlain,
+  };
 
   IO_STATUS_BLOCK IOSB;
-  ScopedUnicodeString CurrentFileName(AnsiPath.c_str());
-
-  OBJECT_ATTRIBUTES FileAttr;
-  InitializeObjectAttributes(&FileAttr, &*CurrentFileName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
-
   ScopedHandle FileHandle;
-  if (NT_SUCCESS(NtOpenFile(&*FileHandle, GENERIC_READ | SYNCHRONIZE, &FileAttr, &IOSB, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT))) {
+  auto TryOpenCandidate = [&](const std::string& PathStr) -> bool {
+    ScopedUnicodeString UnicodeName(PathStr.c_str());
+    OBJECT_ATTRIBUTES FileAttr;
+    InitializeObjectAttributes(&FileAttr, &*UnicodeName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+    return NT_SUCCESS(NtOpenFile(&*FileHandle, GENERIC_READ | SYNCHRONIZE, &FileAttr, &IOSB, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT));
+  };
+
+  bool Opened = false;
+  for (const auto& Cand : Candidates) {
+    if (TryOpenCandidate(Cand)) {
+      Opened = true;
+      break;
+    }
+  }
+
+  if (Opened) {
     ScopedHandle SectionHandle;
     if (NT_SUCCESS(NtCreateSection(&*SectionHandle, SECTION_MAP_EXECUTE | SECTION_MAP_READ, nullptr, nullptr, PAGE_EXECUTE_READ, SEC_COMMIT,
                                    *FileHandle))) {

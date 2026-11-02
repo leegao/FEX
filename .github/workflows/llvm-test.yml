@@ -1,0 +1,737 @@
+name: Wine-aarch64 FEX CI (llvm-aot)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-wow64-fex:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3 \
+            curl \
+            tar \
+            xz-utils \
+            xvfb \
+            libpulse0 \
+            libasound2t64 \
+            libgl1 \
+            libvulkan1 \
+            clang \
+            llvm-dev \
+            libclang-dev \
+            imagemagick \
+            x11-utils
+
+      - name: Install llvm-mingw toolchain (aarch64)
+        run: |
+          LLVM_MINGW_URL="https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-aarch64.tar.xz"
+          mkdir -p /opt/llvm-mingw
+          curl -sSL "$LLVM_MINGW_URL" | tar -xJ -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> $GITHUB_PATH
+
+      - name: Compile hello32.exe and hello64.exe
+        run: |
+          cat << 'EOF' > hello.c
+          #include <windows.h>
+          #include <stdio.h>
+
+          int main(void) {
+              printf("Hello World!\n");
+              return 0;
+          }
+          EOF
+
+          i686-w64-mingw32-clang -O2 hello.c -o hello32.exe
+          x86_64-w64-mingw32-clang -O2 hello.c -o hello64.exe
+
+      - name: Compile 32-bit test_dll.dll and test_dll_main.exe
+        run: |
+          cat << 'EOF' > test_dll.c
+          #include <windows.h>
+
+          __declspec(dllexport) int TargetFunction(void) {
+              static const int value = 42;
+              return value;
+          }
+
+          BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+              return TRUE;
+          }
+          EOF
+
+          cat << 'EOF' > test_dll_main.c
+          #include <windows.h>
+          #include <stdio.h>
+
+          #define PAGE_EXECUTE_FLAGS \
+              (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+
+          int main(void) {
+              printf("Loading relocated test_dll.dll\n");
+              HMODULE hDll = LoadLibraryA("test_dll.dll");
+              printf("test_dll.dll loaded at: %p\n", (void *)hDll);
+
+              typedef int (*fnTarget)(void);
+              fnTarget pTarget = (fnTarget)GetProcAddress(hDll, "TargetFunction");
+              printf("TargetFunction located at: %p\n", (void *)pTarget);
+
+              MEMORY_BASIC_INFORMATION mbi;
+              #define LOG_PROTECTION(pTarget, mbi) \
+                  VirtualQuery((void *)pTarget, &mbi, sizeof(MEMORY_BASIC_INFORMATION)); \
+                  printf("test_dll.dll .text protectection is %s: 0x%08lX, expecting 0x%08lX (PAGE_EXECUTE_READ)\n", \
+                         mbi.Protect == PAGE_EXECUTE_READ ? "CORRECT" : "WRONG", \
+                         mbi.Protect, \
+                         (unsigned long)PAGE_EXECUTE_READ)
+
+              DWORD old_prot;
+              VirtualProtect((void *)pTarget, 4096, PAGE_READWRITE, &old_prot);
+              VirtualProtect((void *)pTarget, 4096, PAGE_EXECUTE_READ, &old_prot);
+
+              printf("Calling TargetFunction...\n");
+              int result = pTarget();
+              printf("TargetFunction(): %d (expected 42)\n", result);
+
+              LOG_PROTECTION(pTarget, mbi);
+
+              FreeLibrary(hDll);
+              return (mbi.Protect == PAGE_EXECUTE_READ) ? 0 : 2;
+          }
+          EOF
+
+          i686-w64-mingw32-clang -shared -O2 test_dll.c \
+              -Wl,--image-base,0x10000 -Wl,--disable-nxcompat -o test_dll.dll
+
+          i686-w64-mingw32-clang -O2 test_dll_main.c \
+              -Wl,--disable-nxcompat -o test_dll_main.exe
+
+      - name: Compile fex_arm64ec_test.exe and close_bc7_window.exe
+        run: |
+          cat << 'EOF' > fex_arm64ec_test.c
+          #include <windows.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <emmintrin.h>
+
+          static void test_cpuid(void) {
+              int cpu_info[4] = {0};
+              __asm__ __volatile__("cpuid"
+                                   : "=a"(cpu_info[0]), "=b"(cpu_info[1]), "=c"(cpu_info[2]), "=d"(cpu_info[3])
+                                   : "a"(0), "c"(0));
+              char vendor[13] = {0};
+              *(int*)(vendor + 0) = cpu_info[1];
+              *(int*)(vendor + 4) = cpu_info[3];
+              *(int*)(vendor + 8) = cpu_info[2];
+              printf("[1/7] x86-64 CPUID: Vendor=%s (MaxLeaf=%d)\n", vendor, cpu_info[0]);
+              fflush(stdout);
+
+              // Leaf 1: Features
+              __asm__ __volatile__("cpuid"
+                                   : "=a"(cpu_info[0]), "=b"(cpu_info[1]), "=c"(cpu_info[2]), "=d"(cpu_info[3])
+                                   : "a"(1), "c"(0));
+              printf("      CPUID Feature Flags: edx=0x%08x, ecx=0x%08x\n", cpu_info[3], cpu_info[2]);
+              fflush(stdout);
+          }
+
+          static void test_sse2(void) {
+              __m128d va = _mm_set_pd(10.5, 20.25);
+              __m128d vb = _mm_set_pd(2.0, 4.0);
+              __m128d vmul = _mm_mul_pd(va, vb);
+              double res[2];
+              _mm_storeu_pd(res, vmul);
+              double dot = res[0] + res[1];
+              if (dot != 102.0) {
+                  printf("[FAIL] SSE2 math mismatch: %.2f (expected 102.0)\n", dot);
+                  exit(1);
+              }
+              printf("[2/7] SSE2 Vector Dot Product: %.2f (expected 102.0)\n", dot);
+              fflush(stdout);
+          }
+
+          static void test_unaligned_atomics_tso(void) {
+              uint8_t buffer[64] __attribute__((aligned(16))) = {0};
+              // Test both within-16B unaligned offset (+3) and cross-16B split-lock offset (+11)
+              const int offsets[2] = {3, 11};
+              for (int i = 0; i < 2; i++) {
+                  volatile uint64_t *unaligned_ptr = (volatile uint64_t*)(buffer + offsets[i]);
+                  *unaligned_ptr = 0x1122334455667788ULL;
+
+                  uint64_t expected = 0x1122334455667788ULL;
+                  uint64_t new_val = 0xAABBCCDDEEFF0011ULL + (uint64_t)i;
+
+                  // Operand numbering: %0=result, %1=*unaligned_ptr, %2=expected (in %rax), %3=new_val
+                  unsigned char result = 0;
+                  __asm__ __volatile__(
+                      "lock cmpxchgq %3, %1\n\t"
+                      "sete %0\n\t"
+                      : "=q"(result), "+m"(*unaligned_ptr), "+a"(expected)
+                      : "r"(new_val)
+                      : "memory", "cc"
+                  );
+
+                  if (!result || *unaligned_ptr != new_val) {
+                      printf("[FAIL] Unaligned atomic CAS (offset +%d) failed: read=0x%llx\n",
+                             offsets[i], (unsigned long long)*unaligned_ptr);
+                      exit(1);
+                  }
+              }
+              printf("[3/7] Unaligned 64-bit Atomic TSO Recovery: OK (val=0x%llx)\n",
+                     (unsigned long long)*(volatile uint64_t*)(buffer + 11));
+              fflush(stdout);
+          }
+
+          static void test_virtual_memory(void) {
+              SIZE_T size = 65536;
+              LPVOID p = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+              if (!p) { printf("[FAIL] VirtualAlloc failed\n"); exit(1); }
+              *(volatile unsigned char*)p = 0x5a;
+
+              DWORD old_prot = 0;
+              if (!VirtualProtect(p, size, PAGE_READONLY, &old_prot)) {
+                  printf("[FAIL] VirtualProtect failed\n");
+                  exit(1);
+              }
+              VirtualFree(p, 0, MEM_RELEASE);
+              printf("[4/7] VirtualAlloc/VirtualProtect/VirtualFree: OK (byte=0x5a, oldProt=0x%lx)\n", old_prot);
+              fflush(stdout);
+          }
+
+          static DWORD WINAPI thread_worker(LPVOID arg) {
+              volatile long *counter = (volatile long*)arg;
+              for (int i = 0; i < 25000; i++) {
+                  InterlockedIncrement(counter);
+              }
+              return 0;
+          }
+
+          static void test_multithreading(void) {
+              volatile long counter = 0;
+              HANDLE threads[4];
+              for (int i = 0; i < 4; i++) {
+                  threads[i] = CreateThread(NULL, 0, thread_worker, (LPVOID)&counter, 0, NULL);
+                  if (!threads[i]) {
+                      printf("[FAIL] CreateThread failed for thread %d\n", i);
+                      exit(1);
+                  }
+              }
+              WaitForMultipleObjects(4, threads, TRUE, INFINITE);
+              for (int i = 0; i < 4; i++) {
+                  CloseHandle(threads[i]);
+              }
+
+              if (counter != 100000) {
+                  printf("[FAIL] Multithreaded interlocked counter mismatch: %ld\n", counter);
+                  exit(1);
+              }
+              printf("[5/7] Win32 Multithreading & Interlocked Atomics: OK (counter=%ld)\n", counter);
+              fflush(stdout);
+          }
+
+          static void test_compiler_stress_registers(void) {
+              register int64_t r1 asm("r8") = 11;
+              register int64_t r2 asm("r9") = 22;
+              register int64_t r3 asm("r10") = 33;
+              register int64_t r4 asm("r11") = 44;
+              register int64_t r5 asm("r12") = 55;
+              register int64_t r6 asm("r13") = 66;
+              register int64_t r7 asm("r14") = 77;
+              register int64_t r8 asm("r15") = 88;
+
+              int64_t sum = r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8;
+              if (sum != 396) {
+                  printf("[FAIL] Register pressure sum mismatch: %lld\n", (long long)sum);
+                  exit(1);
+              }
+              printf("[6/7] FEX Compiler Register Pressure (r8-r15 allocation): OK (sum=%lld)\n", (long long)sum);
+              fflush(stdout);
+          }
+
+          static void test_file_io(void) {
+              char temp_path[MAX_PATH];
+              char temp_file[MAX_PATH];
+              if (!GetTempPathA(MAX_PATH, temp_path)) {
+                  printf("[FAIL] GetTempPathA failed\n");
+                  exit(1);
+              }
+              if (!GetTempFileNameA(temp_path, "fex", 0, temp_file)) {
+                  printf("[FAIL] GetTempFileNameA failed\n");
+                  exit(1);
+              }
+
+              HANDLE h = CreateFileA(temp_file, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+              if (h == INVALID_HANDLE_VALUE) {
+                  printf("[FAIL] CreateFileA failed\n");
+                  exit(1);
+              }
+              const char msg[] = "ARM64EC-FEX Win32 File I/O Verification";
+              DWORD written = 0;
+              WriteFile(h, msg, sizeof(msg), &written, NULL);
+              SetFilePointer(h, 0, NULL, FILE_BEGIN);
+
+              char read_buf[64] = {0};
+              DWORD read_bytes = 0;
+              ReadFile(h, read_buf, sizeof(read_buf), &read_bytes, NULL);
+              CloseHandle(h);
+              DeleteFileA(temp_file);
+
+              if (strcmp(msg, read_buf) != 0) {
+                  printf("[FAIL] File I/O content mismatch: read '%s'\n", read_buf);
+                  exit(1);
+              }
+              printf("[7/7] Win32 File I/O (CreateFile/WriteFile/ReadFile): OK\n");
+              fflush(stdout);
+          }
+
+          int main(void) {
+              SYSTEM_INFO si;
+              GetSystemInfo(&si);
+              printf("=== RUNNING EXPANDED FEX ARM64EC INTEGRATION TESTS ===\n");
+              printf("[0/7] System Info: Arch=%u (9=AMD64), PageSize=%lu, Processors=%lu\n",
+                     (unsigned int)si.wProcessorArchitecture, si.dwPageSize, si.dwNumberOfProcessors);
+              fflush(stdout);
+
+              test_cpuid();
+              test_sse2();
+              test_unaligned_atomics_tso();
+              test_virtual_memory();
+              test_multithreading();
+              test_compiler_stress_registers();
+              test_file_io();
+
+              printf("ALL EXPANDED FEX ARM64EC TESTS PASSED SUCCESSFULLY!\n");
+              fflush(stdout);
+              return 0;
+          }
+          EOF
+
+          cat << 'EOF' > close_bc7_window.c
+          #include <windows.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          static void capture_window_to_bmp(HWND hwnd, const char* filepath) {
+              RECT rc;
+              GetClientRect(hwnd, &rc);
+              int width = rc.right - rc.left;
+              int height = rc.bottom - rc.top;
+              if (width <= 0 || height <= 0) {
+                  width = 800;
+                  height = 600;
+              }
+
+              HDC hdcWindow = GetDC(hwnd);
+              if (!hdcWindow) return;
+              HDC hdcMemDC = CreateCompatibleDC(hdcWindow);
+              if (!hdcMemDC) {
+                  ReleaseDC(hwnd, hdcWindow);
+                  return;
+              }
+
+              HBITMAP hbm = CreateCompatibleBitmap(hdcWindow, width, height);
+              if (!hbm) {
+                  DeleteDC(hdcMemDC);
+                  ReleaseDC(hwnd, hdcWindow);
+                  return;
+              }
+
+              HGDIOBJ oldBmp = SelectObject(hdcMemDC, hbm);
+              BitBlt(hdcMemDC, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
+
+              BITMAPINFOHEADER bih = {0};
+              bih.biSize = sizeof(BITMAPINFOHEADER);
+              bih.biWidth = width;
+              bih.biHeight = height;
+              bih.biPlanes = 1;
+              bih.biBitCount = 24;
+              bih.biCompression = BI_RGB;
+
+              int row_stride = ((width * 3 + 3) & ~3);
+              DWORD image_size = row_stride * height;
+              bih.biSizeImage = image_size;
+
+              void* pixels = malloc(image_size);
+              if (pixels) {
+                  if (GetDIBits(hdcMemDC, hbm, 0, height, pixels, (BITMAPINFO*)&bih, DIB_RGB_COLORS)) {
+                      BITMAPFILEHEADER bfh = {0};
+                      bfh.bfType = 0x4D42; // "BM"
+                      bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+                      bfh.bfSize = bfh.bfOffBits + image_size;
+
+                      FILE* fp = fopen(filepath, "wb");
+                      if (fp) {
+                          fwrite(&bfh, 1, sizeof(bfh), fp);
+                          fwrite(&bih, 1, sizeof(bih), fp);
+                          fwrite(pixels, 1, image_size, fp);
+                          fclose(fp);
+                          printf("[AutoClose] Win32 screenshot saved to %s (%dx%d, %lu bytes)\n",
+                                 filepath, width, height, (unsigned long)bfh.bfSize);
+                          fflush(stdout);
+                      }
+                  }
+                  free(pixels);
+              }
+
+              SelectObject(hdcMemDC, oldBmp);
+              DeleteObject(hbm);
+              DeleteDC(hdcMemDC);
+              ReleaseDC(hwnd, hdcWindow);
+          }
+
+          int main(int argc, char** argv) {
+              const char* screenshot_bmp = (argc > 1) ? argv[1] : "d3d11_bc7_sample.bmp";
+              for (int i = 0; i < 200; i++) {
+                  HWND hwnd = FindWindowW(L"D3D11Window", NULL);
+                  if (!hwnd) {
+                      hwnd = FindWindowW(NULL, L"BC7 Sample");
+                  }
+                  if (hwnd) {
+                      printf("[AutoClose] Detected D3D11Window (HWND=%p); rendering frames for 2000 ms...\n", (void*)hwnd);
+                      fflush(stdout);
+                      Sleep(2000);
+
+                      capture_window_to_bmp(hwnd, screenshot_bmp);
+                      FILE* f = fopen("screenshot_ready.flag", "w");
+                      if (f) { fputs("ready\n", f); fclose(f); }
+
+                      printf("[AutoClose] Screenshot taken; sending WM_CLOSE / WM_QUIT to HWND=%p...\n", (void*)hwnd);
+                      fflush(stdout);
+                      PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                      Sleep(250);
+                      if (IsWindow(hwnd)) {
+                          PostMessageW(hwnd, WM_QUIT, 0, 0);
+                      }
+                      return 0;
+                  }
+                  Sleep(100);
+              }
+              return 0;
+          }
+          EOF
+
+          x86_64-w64-mingw32-clang -O2 fex_arm64ec_test.c -o fex_arm64ec_test.exe
+          x86_64-w64-mingw32-clang -O2 close_bc7_window.c -luser32 -lgdi32 -o close_bc7_window.exe
+
+      - name: Fetch and unpack DroidDeck-Proton 11-11.9
+        run: |
+          PROTON_URL="https://github.com/Droid-Deck/DroidDeck-Proton/releases/download/DroidDeck-Proton-11-11.9/DroidDeck-Proton-11-11.9-aarch64.tar.gz"
+          mkdir -p /opt/droiddeck-proton
+          curl -sSL "$PROTON_URL" | tar -xz -C /opt/droiddeck-proton --strip-components=1
+
+      - name: Build FEX wow64 plugin
+        run: |
+          cmake -S . -B build_wow64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=aarch64-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False \
+            -DTUNE_ARCH=generic \
+            -DTUNE_CPU=none \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_wow64
+          DESTDIR="$PWD/install_fex" cmake --build build_wow64 -t install
+
+      - name: Build FEX wow64 UnixLib (.so)
+        run: |
+          cmake -S Source/Windows/UnixLib -B build_unixlib_wow64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-unix \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build_unixlib_wow64
+          DESTDIR="$PWD/install_fex" cmake --build build_unixlib_wow64 -t install
+
+      - name: Build FEX arm64ec plugin
+        run: |
+          cmake -S . -B build_arm64ec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False \
+            -DTUNE_ARCH=generic \
+            -DTUNE_CPU=none \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_arm64ec
+          DESTDIR="$PWD/install_fex" cmake --build build_arm64ec -t install
+
+      - name: Build FEX arm64ec UnixLib (.so)
+        run: |
+          cmake -S Source/Windows/UnixLib -B build_unixlib_arm64ec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-unix \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build_unixlib_arm64ec
+          DESTDIR="$PWD/install_fex" cmake --build build_unixlib_arm64ec -t install
+
+      - name: Install FEX plugins into DroidDeck-Proton
+        run: |
+          WIN_DIR="/opt/droiddeck-proton/files/lib/wine/aarch64-windows"
+          UNIX_DIR="/opt/droiddeck-proton/files/lib/wine/aarch64-unix"
+
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libwow64fex.dll "$WIN_DIR/libwow64fex.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-unix/libwow64fex.so "$UNIX_DIR/libwow64fex.so"
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libwow64fex.dll "$WIN_DIR/wow64cpu.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libarm64ecfex.dll "$WIN_DIR/libarm64ecfex.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-unix/libarm64ecfex.so "$UNIX_DIR/libarm64ecfex.so"
+
+      - name: Build FEX LLVM-Arm64EC AOT Compiler (fex-aot-pe)
+        run: |
+          chmod +x ./mk-fex-aot-pe.sh
+          ./mk-fex-aot-pe.sh
+          ./build/Bin/fex-aot-pe --help
+
+      - name: AOT compile test binaries and verify Dual PE/COFF Arm64EC containers
+        run: |
+          mkdir -p aot_cache
+          ./build/Bin/fex-aot-pe \
+            --output-dir aot_cache \
+            --audit \
+            --json-out aot_cache/benchmark_hello64.json \
+            hello64.exe
+
+          ./build/Bin/fex-aot-pe \
+            --output-dir aot_cache \
+            --audit \
+            --json-out aot_cache/benchmark_fex_arm64ec_test.json \
+            fex_arm64ec_test.exe
+
+          if [ -f samples/d3d11_bc7_sample.exe ]; then
+            ./build/Bin/fex-aot-pe \
+              --output-dir aot_cache \
+              --audit \
+              --json-out aot_cache/benchmark_d3d11_bc7_sample.json \
+              samples/d3d11_bc7_sample.exe
+          fi
+
+          echo "=== AOT Benchmark JSONs ==="
+          cat aot_cache/*.json || true
+          echo "=== Generated AOT Files ==="
+          ls -la aot_cache/
+
+      - name: Upload libraries and AOT caches
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: wine_dll_artifacts
+          path: |
+            ${{ github.workspace }}/hello32.exe
+            ${{ github.workspace }}/hello64.exe
+            ${{ github.workspace }}/fex_arm64ec_test.exe
+            ${{ github.workspace }}/close_bc7_window.exe
+            ${{ github.workspace }}/samples/d3d11_bc7_sample.exe
+            ${{ github.workspace }}/test_dll_main.exe
+            ${{ github.workspace }}/test_dll.dll
+            ${{ github.workspace }}/aot_cache/*
+          retention-days: 60
+          compression-level: 9
+
+      - name: Run hello32.exe (JIT)
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+        run: |
+          xvfb-run -a wine hello32.exe
+
+      - name: Run hello64.exe (JIT baseline)
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+        run: |
+          xvfb-run -a wine hello64.exe
+
+      - name: Run hello64.exe with LLVM-Arm64EC AOT Cache
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_APP_CACHE_LOCATION: 'C:\fex-cache\'
+          FEX_ENABLECODECACHINGWIP: 1
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          CACHE_DEST="${{ github.workspace }}/wineprefix/drive_c/fex-cache/cache"
+          mkdir -p "$CACHE_DEST"
+          cp -fv aot_cache/*.aot.dll "$CACHE_DEST/"
+          cp -fv aot_cache/*.fxcc "$CACHE_DEST/" 2>/dev/null || true
+          ls -la "$CACHE_DEST"
+
+          OUTPUT=$(xvfb-run -a wine hello64.exe 2>&1 | tee wine_aot.log)
+          echo "$OUTPUT"
+
+          echo "$OUTPUT" | grep "Hello World!"
+
+          if echo "$OUTPUT" | grep -Ei "Cache load|Loaded cache"; then
+            echo "SUCCESS: hello64.exe executed using LLVM-Arm64EC AOT cache!"
+          else
+            echo "WARNING: AOT cache load log entry not detected in stderr (checking exit status)"
+          fi
+
+      - name: Run fex_arm64ec_test.exe (JIT baseline)
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+        run: |
+          xvfb-run -a wine fex_arm64ec_test.exe
+
+      - name: Run fex_arm64ec_test.exe with LLVM-Arm64EC AOT Cache
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_APP_CACHE_LOCATION: 'C:\fex-cache\'
+          FEX_ENABLECODECACHINGWIP: 1
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          CACHE_DEST="${{ github.workspace }}/wineprefix/drive_c/fex-cache/cache"
+          mkdir -p "$CACHE_DEST"
+          cp -fv aot_cache/*.aot.dll "$CACHE_DEST/"
+          cp -fv aot_cache/*.fxcc "$CACHE_DEST/" 2>/dev/null || true
+
+          OUTPUT=$(xvfb-run -a wine fex_arm64ec_test.exe 2>&1 | tee wine_aot_fex_test.log)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep "ALL EXPANDED FEX ARM64EC TESTS PASSED SUCCESSFULLY!"
+
+      - name: Run samples/d3d11_bc7_sample.exe (JIT)
+        if: always()
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          if [ -f samples/d3d11_bc7_sample.exe ]; then
+            mkdir -p screenshots
+            timeout 30s xvfb-run -a bash -c '
+              rm -f screenshot_ready.flag
+              wine close_bc7_window.exe "screenshots/d3d11_bc7_sample_jit.bmp" &
+              CLOSER_PID=$!
+
+              (
+                for i in $(seq 1 100); do
+                  if [ -f screenshot_ready.flag ] || xwininfo -root -tree 2>/dev/null | grep -Ei "BC7 Sample|D3D11Window" >/dev/null; then
+                    sleep 1.5
+                    import -window root screenshots/d3d11_bc7_sample_jit.png 2>/dev/null || xwd -root -silent -out screenshots/d3d11_bc7_sample_jit.xwd 2>/dev/null || true
+                    break
+                  fi
+                  sleep 0.1
+                done
+              ) &
+              SHOT_PID=$!
+
+              wine samples/d3d11_bc7_sample.exe
+              RC=$?
+              wait $CLOSER_PID 2>/dev/null || true
+              wait $SHOT_PID 2>/dev/null || true
+
+              if [ -f screenshots/d3d11_bc7_sample_jit.xwd ] && [ ! -f screenshots/d3d11_bc7_sample_jit.png ]; then
+                convert screenshots/d3d11_bc7_sample_jit.xwd screenshots/d3d11_bc7_sample_jit.png 2>/dev/null || true
+              fi
+              if [ -f screenshots/d3d11_bc7_sample_jit.bmp ] && [ ! -f screenshots/d3d11_bc7_sample_jit.png ]; then
+                convert screenshots/d3d11_bc7_sample_jit.bmp screenshots/d3d11_bc7_sample_jit.png 2>/dev/null || true
+              fi
+              exit $RC
+            ' || true
+            ls -la screenshots/
+          fi
+
+      - name: Run samples/d3d11_bc7_sample.exe with LLVM-Arm64EC AOT Cache
+        if: always()
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_APP_CACHE_LOCATION: 'C:\fex-cache\'
+          FEX_ENABLECODECACHINGWIP: 1
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          if [ -f samples/d3d11_bc7_sample.exe ]; then
+            mkdir -p screenshots
+            CACHE_DEST="${{ github.workspace }}/wineprefix/drive_c/fex-cache/cache"
+            mkdir -p "$CACHE_DEST"
+            cp -fv aot_cache/*.aot.dll "$CACHE_DEST/"
+            cp -fv aot_cache/*.fxcc "$CACHE_DEST/" 2>/dev/null || true
+
+            timeout 30s xvfb-run -a bash -c '
+              rm -f screenshot_ready.flag
+              wine close_bc7_window.exe "screenshots/d3d11_bc7_sample_aot.bmp" &
+              CLOSER_PID=$!
+
+              (
+                for i in $(seq 1 100); do
+                  if [ -f screenshot_ready.flag ] || xwininfo -root -tree 2>/dev/null | grep -Ei "BC7 Sample|D3D11Window" >/dev/null; then
+                    sleep 1.5
+                    import -window root screenshots/d3d11_bc7_sample_aot.png 2>/dev/null || xwd -root -silent -out screenshots/d3d11_bc7_sample_aot.xwd 2>/dev/null || true
+                    break
+                  fi
+                  sleep 0.1
+                done
+              ) &
+              SHOT_PID=$!
+
+              wine samples/d3d11_bc7_sample.exe
+              RC=$?
+              wait $CLOSER_PID 2>/dev/null || true
+              wait $SHOT_PID 2>/dev/null || true
+
+              if [ -f screenshots/d3d11_bc7_sample_aot.xwd ] && [ ! -f screenshots/d3d11_bc7_sample_aot.png ]; then
+                convert screenshots/d3d11_bc7_sample_aot.xwd screenshots/d3d11_bc7_sample_aot.png 2>/dev/null || true
+              fi
+              if [ -f screenshots/d3d11_bc7_sample_aot.bmp ] && [ ! -f screenshots/d3d11_bc7_sample_aot.png ]; then
+                convert screenshots/d3d11_bc7_sample_aot.bmp screenshots/d3d11_bc7_sample_aot.png 2>/dev/null || true
+              fi
+              exit $RC
+            ' || true
+            ls -la screenshots/
+          fi
+
+      - name: Run test_dll_main.exe
+        if: always()
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          xvfb-run -a wine test_dll_main.exe || true
+
+      - name: Upload D3D11 render screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d11_render_screenshots
+          path: |
+            ${{ github.workspace }}/screenshots/*
+            ${{ github.workspace }}/*d3d11*.png
+            ${{ github.workspace }}/*d3d11*.bmp
+          if-no-files-found: ignore
+          retention-days: 60

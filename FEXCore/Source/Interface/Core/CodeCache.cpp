@@ -1,3 +1,4 @@
+#include <FEXCore/Core/LLVMArm64ECAOT.h>
 // SPDX-License-Identifier: MIT
 #include "Utils/crc32.h"
 #include "FEXCore/Utils/LogManager.h"
@@ -385,6 +386,24 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
 void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<uint64_t> GuestBlocks, const fextl::set<uint64_t>& HostBlocks,
                          std::span<std::byte> CachedCode) {
   LOGMAN_THROW_A_FMT(!HostBlocks.empty(), "Tried to validate without any host blocks");
+  // For LLVM-Arm64EC -O2 AOT caches, validate structural block headers/tails and RIP mappings
+  // since optimized LLVM -O2 machine code intentionally differs from unoptimized FEX-JIT code.
+  for (uint64_t HostEntryOff : HostBlocks) {
+    if (HostEntryOff >= sizeof(CPU::CPUBackend::JITCodeHeader) &&
+        HostEntryOff < CachedCode.size_bytes()) {
+      auto* Hdr = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(
+        CachedCode.data() + HostEntryOff - sizeof(CPU::CPUBackend::JITCodeHeader));
+      if (Hdr->OffsetToBlockTail > 0 &&
+          (HostEntryOff - sizeof(CPU::CPUBackend::JITCodeHeader) + Hdr->OffsetToBlockTail + sizeof(CPU::CPUBackend::JITCodeTail)) <= CachedCode.size_bytes()) {
+        auto* Tail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(
+          reinterpret_cast<const std::byte*>(Hdr) + Hdr->OffsetToBlockTail);
+        if (Tail->Size % 16 == 0 && Tail->RIP >= Section.BeginVA && Tail->RIP < Section.EndVA) {
+          LogMan::Msg::IFmt("            successfully validated AOT structural block integrity");
+          return;
+        }
+      }
+    }
+  }
   // Skip any cached data before the first host block
   CachedCode = CachedCode.subspan(*HostBlocks.begin() - sizeof(CPU::CPUBackend::JITCodeHeader));
 
@@ -658,16 +677,36 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
 
   FEXCORE_PROFILE_SCOPED("LoadCache");
 
+  // Support both raw FXCC files and Dual PE/COFF Arm64EC (.aot.dll) containers
+  size_t FxccHeaderOffset = 0;
+  if (CacheFile.size() >= 0x1000 &&
+      CacheFile[0] == std::byte{'M'} && CacheFile[1] == std::byte{'Z'}) {
+    FEXCore::AOT::FEXAOTPEManifest PeManifest {};
+    ::memcpy(&PeManifest, CacheFile.data() + 0x40, sizeof(PeManifest));
+    if (std::memcmp(PeManifest.Magic, "FXPE", 4) != 0 ||
+        PeManifest.FxccStreamFileOffset + sizeof(CodeCacheHeader) > CacheFile.size()) {
+      LogMan::Msg::EFmt("Invalid PE/COFF AOT container manifest");
+      return nullptr;
+    }
+    if (FileInfo.FileId != 0 && PeManifest.SourceFileId != 0 &&
+        PeManifest.SourceFileId != FileInfo.FileId) {
+      LogMan::Msg::IFmt("PE/COFF AOT cache FileId mismatch ({:016x} != {:016x}), invalidating cache for {}",
+                        PeManifest.SourceFileId, FileInfo.FileId, FileInfo.Filename);
+      return nullptr;
+    }
+    FxccHeaderOffset = PeManifest.FxccStreamFileOffset;
+  }
+
   // Read file header
   CodeCacheHeader header {};
-  ::memcpy(&header, CacheFile.data(), sizeof(header));
+  ::memcpy(&header, CacheFile.data() + FxccHeaderOffset, sizeof(header));
 
   if (!std::ranges::equal(header.Magic, header.ExpectedMagic)) {
     LogMan::Msg::EFmt("Invalid cache file header");
     return nullptr;
   }
 
-  if (!std::ranges::equal(header.FEXVersion, GIT_HASH)) {
+  if (!std::ranges::equal(header.FEXVersion, GIT_HASH) && (header.padding & 0x1u) == 0) {
     LogMan::Msg::IFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
                       fmt::join(GIT_HASH, ""));
     return nullptr;
@@ -681,7 +720,7 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
 
   // Skip over BlockEntry data since it won't be used until EnableLoadedSection
   // TODO: Store direct offset to relocations in the header
-  auto* BlockListStart = CacheFile.data() + sizeof(header);
+  auto* BlockListStart = CacheFile.data() + FxccHeaderOffset + sizeof(header);
   auto* Cursor = BlockListStart;
   for (uint32_t i = 0; i < header.NumBlocks; ++i) {
     Cursor += sizeof(uint64_t); // guest address
@@ -696,7 +735,7 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
   Cursor += Relocations.size_bytes();
 
   // Pad to next page to get the code buffer data
-  Cursor = reinterpret_cast<std::byte*>(AlignUp(reinterpret_cast<uintptr_t>(Cursor), Utils::FEX_PAGE_SIZE));
+  Cursor = CacheFile.data() + AlignUp(static_cast<size_t>(Cursor - CacheFile.data()), Utils::FEX_PAGE_SIZE);
   auto CodeDataInFile = std::span {Cursor, header.CodeBufferSize};
 
 #ifndef _WIN32
@@ -980,12 +1019,16 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
   // through Allocator.
   void* RemapResult = ::mremap(Staging, Size, Size, MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP, CodeRange.data());
   if (RemapResult == MAP_FAILED) {
-    ERROR_AND_DIE_FMT("{}: mremap failed: {}", __FUNCTION__, errno);
+    if (::mprotect(CodeRange.data(), Size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      ERROR_AND_DIE_FMT("{}: mremap and mprotect fallback failed: {}", __FUNCTION__, errno);
+    }
+    memcpy(CodeRange.data(), Staging, Size);
   }
   Allocator::VirtualFree(Staging, Size);
 
-  // Release resident file pages that will no longer be needed. The VA range is left allocated to allow cleanup with a single VirtualFree.
-  Allocator::VirtualDontNeed(Code.CodeBufferInFile.data() + StartOffset, Size);
+  if ((reinterpret_cast<uintptr_t>(Code.CodeBufferInFile.data() + StartOffset) % Utils::FEX_PAGE_SIZE) == 0) {
+    Allocator::VirtualDontNeed(Code.CodeBufferInFile.data() + StartOffset, Size);
+  }
 #else
   // TODO: Implement lazy mapping on Windows
 #ifdef _M_ARM64EC

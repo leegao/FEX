@@ -386,6 +386,10 @@ namespace DiskCache {
 
         // Current behaviour is to remove entries that no longer match the MachineBucketHash.
         // This means that if the Disk Cache version no longer matches, or the FEXCore::HostFeatures differ, then they get removed.
+        // Protect AOT code caches and dedicated AOT directories from routine DiskCache pruning
+        if (name == "aot" || name == "cache" || name.starts_with("aot_") || name.ends_with(".aot.dll")) {
+          return;
+        }
         if (name != capture->MachineBucketHash) {
           FEXCore::FileUtils::RecursiveRemoveDirectory(fextl::fmt::format("{}/{}", capture->CacheBase, name));
         }

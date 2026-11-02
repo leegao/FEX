@@ -17,7 +17,7 @@ struct FlexBitSet final {
   constexpr static size_t MinimumSize = sizeof(ElementType);
   constexpr static size_t MinimumSizeBits = sizeof(ElementType) * 8;
 
-  T Memory[];
+  T Memory[0];
 
   bool Get(size_t Element) const {
     return (Memory[Element / MinimumSizeBits] & (1ULL << (Element % MinimumSizeBits))) != 0;

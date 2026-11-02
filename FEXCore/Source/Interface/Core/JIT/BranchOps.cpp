@@ -1,3 +1,7 @@
+#if defined(ARCHITECTURE_arm64ec) && !defined(_WIN32)
+#include <cstdint>
+extern "C" __attribute__((weak)) bool RtlIsEcCode(uint64_t) { return false; }
+#endif
 // SPDX-License-Identifier: MIT
 /*
 $info$

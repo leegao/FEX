@@ -30,3 +30,8 @@ LinkerGC(FEXOfflineCompiler)
 install(TARGETS FEXOfflineCompiler RUNTIME
   DESTINATION bin
   COMPONENT Runtime)
+
+if (NOT MINGW)
+  add_executable(fex-aot-pe EXCLUDE_FROM_ALL FEXAOTPECompiler.cpp)
+  target_link_libraries(fex-aot-pe PRIVATE FEXCore FEXCore_Base JemallocDummy fmt::fmt xxHash::xxhash cephes_128bit softfloat_3e LLVM ${PTHREAD_LIB} dl atomic)
+endif()
