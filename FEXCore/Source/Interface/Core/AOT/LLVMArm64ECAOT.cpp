@@ -103,6 +103,7 @@ void LLVMDisposeErrorMessage(char *ErrMsg);
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -112,6 +113,15 @@ void LLVMDisposeErrorMessage(char *ErrMsg);
 namespace FEXCore::AOT {
 
 namespace {
+
+// Direct in-memory llvm::IRBuilder<> C-API wrapper (LLVMBuilderRef)
+struct LLVMArm64ECIRBuilder {
+#ifdef FEX_HAS_LLVM_AOT
+  LLVMContextRef Ctx = nullptr;
+  explicit LLVMArm64ECIRBuilder(LLVMContextRef C) : Ctx(C) {}
+#endif
+};
+
 
 struct LLVMRuntimeInit {
   LLVMRuntimeInit() {
@@ -189,6 +199,14 @@ static uint32_t EncodeAArch64B(int32_t WordOffset) {
   return 0x14000000u | (static_cast<uint32_t>(WordOffset) & 0x03FFFFFFu);
 }
 
+static bool DestinationIsGuestRSP(FEXCore::IR::Ref Node) {
+  if (!Node) return false;
+  FEXCore::IR::PhysicalRegister PR(Node);
+  if (PR.IsInvalid()) return false;
+  // In FEX's x64 SRA mapping, index 4 is RSP (mapped to x23).
+  return PR.AsRegClass() == FEXCore::IR::RegClass::GPRFixed && PR.Reg == 4;
+}
+
 } // namespace
 
 uint64_t ComputePEFileId(std::string_view BaseNameLower, uint32_t TimeDateStamp, uint32_t SizeOfImage) {
@@ -225,20 +243,326 @@ LLVMArm64ECAOTCompiler::LLVMArm64ECAOTCompiler(const Options& Opts_)
 
 LLVMArm64ECAOTCompiler::~LLVMArm64ECAOTCompiler() = default;
 
+FunctionSafetyAnalysis
+LLVMArm64ECAOTCompiler::AnalyzeFunctionSafety(uint64_t GuestEntryVA, uint64_t GuestSize,
+                                              uint32_t GuestInstCount,
+                                              const FEXCore::IR::IRListView& IR) const {
+  (void)GuestEntryVA;
+  (void)GuestSize;
+  FunctionSafetyAnalysis Analysis {};
+
+  std::unordered_map<uint32_t, uint32_t> BlockNodeToId;
+  for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
+    auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+    BlockNodeToId[IR.GetID(BlockNode).Value] = BlockIROp->ID;
+  }
+
+  bool FlagsWrittenSoFar = false;
+
+  auto RecordReadOperand = [&](FEXCore::IR::OrderedNodeWrapper W) {
+    if (W.IsInvalid() || !W.IsImmediate()) return;
+    FEXCore::IR::PhysicalRegister PR(W);
+    if (PR.IsInvalid()) return;
+    if (PR.AsRegClass() == FEXCore::IR::RegClass::GPRFixed && PR.Reg < 18) {
+      uint32_t Bit = 1u << PR.Reg;
+      if ((Analysis.LiveOutGPRMask & Bit) == 0) {
+        Analysis.LiveInGPRMask |= Bit;
+      }
+      Analysis.UsedGPRMask |= Bit;
+    } else if (PR.AsRegClass() == FEXCore::IR::RegClass::FPRFixed && PR.Reg < 16) {
+      uint16_t Bit = static_cast<uint16_t>(1u << PR.Reg);
+      if ((Analysis.LiveOutFPRMask & Bit) == 0) {
+        Analysis.LiveInFPRMask |= Bit;
+      }
+      Analysis.UsedFPRMask |= Bit;
+    }
+  };
+
+  auto RecordWriteDest = [&](FEXCore::IR::Ref Node) {
+    if (!Node) return;
+    FEXCore::IR::PhysicalRegister PR(Node);
+    if (PR.IsInvalid()) return;
+    if (PR.AsRegClass() == FEXCore::IR::RegClass::GPRFixed && PR.Reg < 18) {
+      uint32_t Bit = 1u << PR.Reg;
+      Analysis.LiveOutGPRMask |= Bit;
+      Analysis.UsedGPRMask |= Bit;
+    } else if (PR.AsRegClass() == FEXCore::IR::RegClass::FPRFixed && PR.Reg < 16) {
+      uint16_t Bit = static_cast<uint16_t>(1u << PR.Reg);
+      Analysis.LiveOutFPRMask |= Bit;
+      Analysis.UsedFPRMask |= Bit;
+    }
+  };
+
+  auto RecordWriteWrapper = [&](FEXCore::IR::OrderedNodeWrapper W) {
+    if (W.IsInvalid()) return;
+    if (W.IsImmediate()) {
+      FEXCore::IR::PhysicalRegister PR(W);
+      if (PR.IsInvalid()) return;
+      if (PR.AsRegClass() == FEXCore::IR::RegClass::GPRFixed && PR.Reg < 18) {
+        uint32_t Bit = 1u << PR.Reg;
+        Analysis.LiveOutGPRMask |= Bit;
+        Analysis.UsedGPRMask |= Bit;
+      } else if (PR.AsRegClass() == FEXCore::IR::RegClass::FPRFixed && PR.Reg < 16) {
+        uint16_t Bit = static_cast<uint16_t>(1u << PR.Reg);
+        Analysis.LiveOutFPRMask |= Bit;
+        Analysis.UsedFPRMask |= Bit;
+      }
+    } else if (W.IsPointer()) {
+      RecordWriteDest(IR.GetNode(W));
+    }
+  };
+
+  for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
+    (void)BlockHeader;
+    for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
+      const uint8_t NumArgs = FEXCore::IR::GetArgs(IROp->Op);
+      for (uint8_t i = 0; i < NumArgs; ++i) {
+        RecordReadOperand(IROp->Args[i]);
+      }
+
+      switch (IROp->Op) {
+      case FEXCore::IR::OP_LOADREGISTER: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_LoadRegister>();
+        if (Op->Class == FEXCore::IR::RegClass::GPR && Op->Reg < 18) {
+          uint32_t Bit = 1u << Op->Reg;
+          if ((Analysis.LiveOutGPRMask & Bit) == 0) Analysis.LiveInGPRMask |= Bit;
+          Analysis.UsedGPRMask |= Bit;
+        } else if (Op->Class == FEXCore::IR::RegClass::FPR && Op->Reg < 16) {
+          uint16_t Bit = static_cast<uint16_t>(1u << Op->Reg);
+          if ((Analysis.LiveOutFPRMask & Bit) == 0) Analysis.LiveInFPRMask |= Bit;
+          Analysis.UsedFPRMask |= Bit;
+        }
+        break;
+      }
+      case FEXCore::IR::OP_STOREREGISTER: {
+        RecordWriteDest(CodeNode);
+        break;
+      }
+      case FEXCore::IR::OP_LOADPF:
+      case FEXCore::IR::OP_LOADAF:
+      case FEXCore::IR::OP_LOADNZCV:
+      case FEXCore::IR::OP_ADC:
+      case FEXCore::IR::OP_ADCWITHFLAGS:
+      case FEXCore::IR::OP_ADCNZCV:
+      case FEXCore::IR::OP_ADCZERO:
+      case FEXCore::IR::OP_ADCZEROWITHFLAGS:
+      case FEXCore::IR::OP_SBB:
+      case FEXCore::IR::OP_SBBWITHFLAGS:
+      case FEXCore::IR::OP_SBBNZCV:
+      case FEXCore::IR::OP_NZCVSELECT:
+      case FEXCore::IR::OP_NZCVSELECTINCREMENT:
+      case FEXCore::IR::OP_CONDADDNZCV:
+      case FEXCore::IR::OP_CONDSUBNZCV:
+      case FEXCore::IR::OP_CARRYINVERT: {
+        if (!FlagsWrittenSoFar) {
+          Analysis.ReadsFlagsIn = true;
+        }
+        if (IROp->Op == FEXCore::IR::OP_ADCWITHFLAGS || IROp->Op == FEXCore::IR::OP_ADCNZCV ||
+            IROp->Op == FEXCore::IR::OP_ADCZEROWITHFLAGS || IROp->Op == FEXCore::IR::OP_SBBWITHFLAGS ||
+            IROp->Op == FEXCore::IR::OP_SBBNZCV || IROp->Op == FEXCore::IR::OP_CONDADDNZCV ||
+            IROp->Op == FEXCore::IR::OP_CONDSUBNZCV || IROp->Op == FEXCore::IR::OP_CARRYINVERT) {
+          FlagsWrittenSoFar = true;
+          Analysis.WritesFlagsOut = true;
+        }
+        break;
+      }
+      case FEXCore::IR::OP_STOREPF: {
+        FlagsWrittenSoFar = true;
+        Analysis.WritesFlagsOut = true;
+        Analysis.LiveOutGPRMask |= (1u << 16);
+        Analysis.UsedGPRMask |= (1u << 16);
+        break;
+      }
+      case FEXCore::IR::OP_STOREAF: {
+        FlagsWrittenSoFar = true;
+        Analysis.WritesFlagsOut = true;
+        Analysis.LiveOutGPRMask |= (1u << 17);
+        Analysis.UsedGPRMask |= (1u << 17);
+        break;
+      }
+      case FEXCore::IR::OP_STORENZCV:
+      case FEXCore::IR::OP_ADDWITHFLAGS:
+      case FEXCore::IR::OP_ADDNZCV:
+      case FEXCore::IR::OP_SUBWITHFLAGS:
+      case FEXCore::IR::OP_SUBNZCV:
+      case FEXCore::IR::OP_ANDWITHFLAGS:
+      case FEXCore::IR::OP_TESTNZ:
+      case FEXCore::IR::OP_TESTZ:
+      case FEXCore::IR::OP_RMIFNZCV:
+      case FEXCore::IR::OP_SETSMALLNZV: {
+        FlagsWrittenSoFar = true;
+        Analysis.WritesFlagsOut = true;
+        break;
+      }
+      case FEXCore::IR::OP_NEG: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Neg>();
+        if (Op->Cond != FEXCore::IR::CondClass::AL) {
+          FlagsWrittenSoFar = true;
+          Analysis.WritesFlagsOut = true;
+        }
+        break;
+      }
+      case FEXCore::IR::OP_PUSH: {
+        break;
+      }
+      case FEXCore::IR::OP_PUSHTWO: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_PushTwo>();
+        RecordWriteWrapper(Op->Addr);
+        break;
+      }
+      case FEXCore::IR::OP_POP: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Pop>();
+        RecordWriteWrapper(Op->OutValue);
+        RecordWriteWrapper(Op->InoutAddr);
+        break;
+      }
+      case FEXCore::IR::OP_POPTWO: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_PopTwo>();
+        RecordWriteWrapper(Op->OutValue1);
+        RecordWriteWrapper(Op->OutValue2);
+        RecordWriteWrapper(Op->InoutAddr);
+        break;
+      }
+      case FEXCore::IR::OP_DIV:
+      case FEXCore::IR::OP_UDIV: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Div>();
+        RecordWriteWrapper(Op->OutQuotient);
+        RecordWriteWrapper(Op->OutRemainder);
+        break;
+      }
+      case FEXCore::IR::OP_CPUID: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_CPUID>();
+        RecordWriteWrapper(Op->OutEAX);
+        RecordWriteWrapper(Op->OutEBX);
+        RecordWriteWrapper(Op->OutECX);
+        RecordWriteWrapper(Op->OutEDX);
+        break;
+      }
+      case FEXCore::IR::OP_XGETBV: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_XGetBV>();
+        RecordWriteWrapper(Op->OutEAX);
+        RecordWriteWrapper(Op->OutEDX);
+        break;
+      }
+      case FEXCore::IR::OP_ATOMICFETCHADD:
+      case FEXCore::IR::OP_ATOMICFETCHSUB:
+      case FEXCore::IR::OP_ATOMICFETCHAND:
+      case FEXCore::IR::OP_ATOMICFETCHOR:
+      case FEXCore::IR::OP_ATOMICFETCHXOR:
+      case FEXCore::IR::OP_CAS:
+      case FEXCore::IR::OP_ATOMICSWAP: {
+        Analysis.HasAtomicOps = true;
+        break;
+      }
+      case FEXCore::IR::OP_JUMP: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Jump>();
+        if (!BlockNodeToId.contains(Op->TargetBlock.ID().Value)) {
+          Analysis.DisqualificationMask |= DISQUALIFY_OPEN_INTERNAL_CFG;
+        }
+        break;
+      }
+      case FEXCore::IR::OP_CONDJUMP: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_CondJump>();
+        if (Op->FromNZCV && !FlagsWrittenSoFar) {
+          Analysis.ReadsFlagsIn = true;
+        }
+        if (!BlockNodeToId.contains(Op->TrueBlock.ID().Value) ||
+            !BlockNodeToId.contains(Op->FalseBlock.ID().Value)) {
+          Analysis.DisqualificationMask |= DISQUALIFY_OPEN_INTERNAL_CFG;
+        }
+        break;
+      }
+      case FEXCore::IR::OP_EXITFUNCTION: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_ExitFunction>();
+        bool IsDirect = false;
+        if (Op->NewRIP.IsPointer()) {
+          auto* RipHdr = IR.GetOp<FEXCore::IR::IROp_Header>(Op->NewRIP);
+          if (RipHdr->Op == FEXCore::IR::OP_INLINECONSTANT ||
+              RipHdr->Op == FEXCore::IR::OP_INLINEENTRYPOINTOFFSET) {
+            IsDirect = true;
+          }
+        }
+        if (Op->Hint == FEXCore::IR::BranchHint::Call) {
+          if (IsDirect) Analysis.HasDirectCalls = true;
+          else Analysis.HasIndirectCalls = true;
+        } else if (Op->Hint == FEXCore::IR::BranchHint::Return) {
+          Analysis.HasReturns = true;
+        } else if (!IsDirect) {
+          // Indirect jump that is neither a Return nor a Call (e.g. unrecovered switch table / tail dispatch)
+          Analysis.DisqualificationMask |= DISQUALIFY_UNRESOLVED_INDIRECT_JUMP;
+        }
+        break;
+      }
+      case FEXCore::IR::OP_BREAK: {
+        Analysis.DisqualificationMask |= DISQUALIFY_HAS_OP_BREAK;
+        break;
+      }
+      default:
+        break;
+      }
+
+      if (FEXCore::IR::GetHasDest(IROp->Op)) {
+        RecordWriteDest(CodeNode);
+      }
+    }
+  }
+
+  if (GuestInstCount <= 1 && !Analysis.HasReturns) {
+    Analysis.DisqualificationMask |= DISQUALIFY_SINGLE_INST_THUNK;
+  }
+
+  const char* EnvMode = std::getenv("FEX_AOT_MODE");
+  if (Opts.ForceAllFEXSRA || !Opts.EnableDualABIPartitioning ||
+      (EnvMode && std::string_view(EnvMode) == "sra")) {
+    Analysis.DisqualificationMask |= DISQUALIFY_FORCED_SRA_MODE;
+  }
+
+  if (Analysis.DisqualificationMask == DISQUALIFY_NONE) {
+    Analysis.SelectedABI = AOTTargetABI::ARM64EC_NATIVE;
+    Analysis.SummaryReason = "SAFE_ARM64EC_NATIVE";
+  } else {
+    Analysis.SelectedABI = AOTTargetABI::FEX_SRA;
+    std::string Reasons;
+    if (Analysis.DisqualificationMask & DISQUALIFY_UNRESOLVED_INDIRECT_JUMP) Reasons += "unresolved_indirect_jmp,";
+    if (Analysis.DisqualificationMask & DISQUALIFY_HAS_OP_BREAK) Reasons += "op_break,";
+    if (Analysis.DisqualificationMask & DISQUALIFY_SINGLE_INST_THUNK) Reasons += "single_inst_thunk,";
+    if (Analysis.DisqualificationMask & DISQUALIFY_OPEN_INTERNAL_CFG) Reasons += "open_cfg,";
+    if (Analysis.DisqualificationMask & DISQUALIFY_FORCED_SRA_MODE) Reasons += "forced_sra,";
+    if (!Reasons.empty() && Reasons.back() == ',') Reasons.pop_back();
+    Analysis.SummaryReason = "FALLBACK_FEX_SRA(" + Reasons + ")";
+  }
+
+  return Analysis;
+}
+
 LLVMArm64ECAOTCompiler::LiftedFunctionIR
 LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, uint32_t GuestInstCount,
                                      const FEXCore::IR::IRListView& IR) const {
+  FunctionSafetyAnalysis Safety = AnalyzeFunctionSafety(GuestEntryVA, GuestSize, GuestInstCount, IR);
+  LiftedFunctionIR Res = LiftIRToLLVM(GuestEntryVA, GuestSize, GuestInstCount, IR, Safety.SelectedABI);
+  Res.Safety = std::move(Safety);
+  return Res;
+}
+
+LLVMArm64ECAOTCompiler::LiftedFunctionIR
+LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, uint32_t GuestInstCount,
+                                     const FEXCore::IR::IRListView& IR, AOTTargetABI ExplicitABI) const {
   LiftedFunctionIR Result;
   Result.GuestEntryVA = GuestEntryVA;
   Result.GuestSize = GuestSize;
   Result.GuestInstCount = GuestInstCount;
   Result.SingleInst = (GuestInstCount == 1);
+  Result.TargetABI = ExplicitABI;
+  Result.Safety = AnalyzeFunctionSafety(GuestEntryVA, GuestSize, GuestInstCount, IR);
+  Result.Safety.SelectedABI = ExplicitABI;
+
+  const bool IsArm64ECNative = (ExplicitABI == AOTTargetABI::ARM64EC_NATIVE);
 
   char FnNameBuf[64];
   snprintf(FnNameBuf, sizeof(FnNameBuf), "fex_fn_%llx", static_cast<unsigned long long>(GuestEntryVA));
   Result.FunctionName = FnNameBuf;
 
-  // First pass: map all CodeBlock NodeIDs to dense block indices and inspect which register classes are used.
+  // Map all CodeBlock NodeIDs to dense block indices and inspect which register classes are used.
   std::unordered_map<uint32_t, uint32_t> BlockNodeToId;
   bool UsesFPR = false;
   bool UsesEntrypointOffset = false;
@@ -274,8 +598,18 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
   }
   Result.BasicBlockCount = BlockIdx;
 
+  // Unified Lifter with Target-Specialized ABI Lowering:
+  // - ARM64EC_NATIVE functions are emitted into `.text_ec$<Fn>` with attribute #1,
+  //   liveness-pruned entry/exit flag handling (eliminating dead `mrs nzcv` / `msr nzcv`
+  //   and dead Rellume flag calculations across Call/Return boundaries), and single-block
+  //   straight-line RIP-relative base resolution.
+  // - FEX_SRA functions are emitted into `.text_fex$<Fn>` with attribute #0 and full
+  //   18-GPR / 16-FPR / NZCV state pinning across all exits.
   std::ostringstream OS;
-  OS << "define ghccc void @" << Result.FunctionName << "() #0 section \".text$" << Result.FunctionName << "\" {\n";
+  const char* SectionPrefix = IsArm64ECNative ? ".text_ec$" : ".text_fex$";
+  const char* AttrGroup = IsArm64ECNative ? "#1" : "#0";
+  OS << "define ghccc void @" << Result.FunctionName << "() " << AttrGroup
+     << " section \"" << SectionPrefix << Result.FunctionName << "\" {\n";
   OS << "entry:\n";
 
   // Allocate SSA-promotable slots for all 18 SRA GPRFixed registers, 16 GPR dynamic registers,
@@ -295,25 +629,43 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
     }
   }
 
-  // Pin live-in Arm64EC SRA registers at function entry:
-  // StaticRegisters order in Arm64Emitter.cpp (ARCHITECTURE_arm64ec):
-  // 0:x8(RAX), 1:x0(RCX), 2:x1(RDX), 3:x27(RBX), 4:x23(RSP), 5:fp(RBP), 6:x25(RSI), 7:x26(RDI),
-  // 8:x2(R8), 9:x3(R9), 10:x4(R10), 11:x5(R11), 12:x19(R12), 13:x20(R13), 14:x21(R14), 15:x22(R15),
-  // 16:x9(PF), 17:x24(AF), plus 18:x17(CALLRET_SP), 19:x28(STATE)
-  OS << "  %sra_in = call %SRAState asm \"\", "
-        "\"={x8},={x0},={x1},={x27},={x23},={fp},={x25},={x26},={x2},={x3},={x4},={x5},={x19},={x20},={x21},={x22},={x9},={x24},={x17},={x28}\"()\n";
-  for (int i = 0; i < 18; ++i) {
-    OS << "  %in_gpr_" << i << " = extractvalue %SRAState %sra_in, " << i << "\n";
-    OS << "  store i64 %in_gpr_" << i << ", ptr %sra_gpr_" << i << ", align 8\n";
+  // Bind live-in registers at function entry:
+  if (IsArm64ECNative && !Result.Safety.ReadsFlagsIn) {
+    OS << "  %sra_in = call %SRAStateEC asm \"\", "
+          "\"={x8},={x0},={x1},={x27},={x23},={fp},={x25},={x26},={x2},={x3},={x4},={x5},={x19},={x20},={x21},={x22},={x17},={x28}\"()\n";
+    for (int i = 0; i < 16; ++i) {
+      OS << "  %in_gpr_" << i << " = extractvalue %SRAStateEC %sra_in, " << i << "\n";
+      OS << "  store i64 %in_gpr_" << i << ", ptr %sra_gpr_" << i << ", align 8\n";
+    }
+    OS << "  store i64 1, ptr %sra_gpr_16, align 8\n";
+    OS << "  store i64 0, ptr %sra_gpr_17, align 8\n";
+    OS << "  %in_crsp = extractvalue %SRAStateEC %sra_in, 16\n";
+    OS << "  store i64 %in_crsp, ptr %callret_sp_reg, align 8\n";
+    OS << "  %state_ptr_int = extractvalue %SRAStateEC %sra_in, 17\n";
+  } else {
+    OS << "  %sra_in = call %SRAState asm \"\", "
+          "\"={x8},={x0},={x1},={x27},={x23},={fp},={x25},={x26},={x2},={x3},={x4},={x5},={x19},={x20},={x21},={x22},={x9},={x24},={x17},={x28}\"()\n";
+    for (int i = 0; i < 18; ++i) {
+      OS << "  %in_gpr_" << i << " = extractvalue %SRAState %sra_in, " << i << "\n";
+      OS << "  store i64 %in_gpr_" << i << ", ptr %sra_gpr_" << i << ", align 8\n";
+    }
+    OS << "  %in_crsp = extractvalue %SRAState %sra_in, 18\n";
+    OS << "  store i64 %in_crsp, ptr %callret_sp_reg, align 8\n";
+    OS << "  %state_ptr_int = extractvalue %SRAState %sra_in, 19\n";
   }
-  OS << "  %in_crsp = extractvalue %SRAState %sra_in, 18\n";
-  OS << "  store i64 %in_crsp, ptr %callret_sp_reg, align 8\n";
-  OS << "  %state_ptr_int = extractvalue %SRAState %sra_in, 19\n";
   for (int i = 0; i < 16; ++i) {
     OS << "  store i64 0, ptr %tmp_gpr_" << i << ", align 8\n";
   }
-  OS << "  %in_nzcv = call i64 asm \"mrs $0, nzcv\", \"=r\"()\n";
-  OS << "  store i64 %in_nzcv, ptr %nzcv_reg, align 8\n";
+
+  // In ARM64EC_NATIVE mode, only read hardware NZCV via `mrs` if the function actually
+  // reads flags before writing them (Safety.ReadsFlagsIn). Standard C/C++/Win32 functions
+  // never take arguments in RFLAGS, saving a serializing `mrs` at function entry!
+  if (!IsArm64ECNative || Result.Safety.ReadsFlagsIn) {
+    OS << "  %in_nzcv = call i64 asm \"mrs $0, nzcv\", \"=r\"()\n";
+    OS << "  store i64 %in_nzcv, ptr %nzcv_reg, align 8\n";
+  } else {
+    OS << "  store i64 0, ptr %nzcv_reg, align 8\n";
+  }
 
   if (UsesFPR) {
     OS << "  %fpr_in = call %SRAFPRState asm \"\", "
@@ -556,20 +908,13 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
     OS << "  %hdr_slot_addr = add i64 %state_ptr_int, " << InlineHdrOff << "\n";
     OS << "  %hdr_slot_ptr = inttoptr i64 %hdr_slot_addr to ptr\n";
     OS << "  %hdr_ptr_int = load i64, ptr %hdr_slot_ptr, align 8\n";
-    OS << "  %has_hdr = icmp ne i64 %hdr_ptr_int, 0\n";
-    OS << "  br i1 %has_hdr, label %load_tail_rip, label %entry_va_merge\n\n";
-    OS << "load_tail_rip:\n";
     OS << "  %hdr_ptr = inttoptr i64 %hdr_ptr_int to ptr\n";
     OS << "  %tail_off32 = load i32, ptr %hdr_ptr, align 4\n";
     OS << "  %tail_off64 = zext i32 %tail_off32 to i64\n";
     OS << "  %tail_rip_addr = add i64 %hdr_ptr_int, %tail_off64\n";
     OS << "  %tail_rip_addr2 = add i64 %tail_rip_addr, " << TailRipOff << "\n";
     OS << "  %tail_rip_ptr = inttoptr i64 %tail_rip_addr2 to ptr\n";
-    OS << "  %loaded_rip = load i64, ptr %tail_rip_ptr, align 8\n";
-    OS << "  br label %entry_va_merge\n\n";
-    OS << "entry_va_merge:\n";
-    OS << "  %runtime_entry_va = phi i64 [ %loaded_rip, %load_tail_rip ], [ "
-       << static_cast<int64_t>(GuestEntryVA) << ", %entry ]\n";
+    OS << "  %runtime_entry_va = load i64, ptr %tail_rip_ptr, align 8\n";
   }
   OS << "  br label %bb_" << FirstBlockId << "\n\n";
 
@@ -577,6 +922,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
     OS << "bb_" << BlockIROp->ID << ":\n";
     bool BlockTerminated = false;
+    bool UnconsumedNonRspFlags = false;
 
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       if (BlockTerminated) break;
@@ -594,7 +940,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
 
       case FEXCore::IR::OP_GUESTOPCODE: {
         auto* Op = IROp->C<FEXCore::IR::IROp_GuestOpcode>();
-        Result.GuestOpcodes.push_back({Op->GuestEntryOffset, 0});
+        Result.GuestOpcodes.push_back({Op->GuestEntryOffset, BlockIROp->ID});
         break;
       }
 
@@ -723,6 +1069,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string V = NextVal();
         OS << "  " << V << " = load i64, ptr %nzcv_reg, align 8\n";
         StoreGPRDest(CodeNode, V);
+        UnconsumedNonRspFlags = false;
         break;
       }
 
@@ -730,6 +1077,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         auto* Op = IROp->C<FEXCore::IR::IROp_StoreNZCV>();
         std::string V = LoadGPROperand(Op->Value);
         OS << "  store i64 " << V << ", ptr %nzcv_reg, align 8\n";
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -928,8 +1276,12 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string R = NextVal();
         OS << "  " << R << " = add i64 " << A << ", " << B << "\n";
         R = MaskToOpSize(R, OpSize);
-        if (IROp->Op != FEXCore::IR::OP_ADD) {
+        bool IsRspAdj = IsArm64ECNative && (DestinationIsGuestRSP(CodeNode) ||
+                        (Op->Src1.IsImmediate() && FEXCore::IR::PhysicalRegister(Op->Src1).AsRegClass() == FEXCore::IR::RegClass::GPRFixed &&
+                         FEXCore::IR::PhysicalRegister(Op->Src1).Reg == 4));
+        if (IROp->Op != FEXCore::IR::OP_ADD && !IsRspAdj) {
           PackNZCVFromAddSub(A, B, R, OpSize, false);
+          UnconsumedNonRspFlags = true;
         }
         if (IROp->Op != FEXCore::IR::OP_ADDNZCV) {
           StoreGPRDest(CodeNode, R);
@@ -946,8 +1298,12 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string R = NextVal();
         OS << "  " << R << " = sub i64 " << A << ", " << B << "\n";
         R = MaskToOpSize(R, OpSize);
-        if (IROp->Op != FEXCore::IR::OP_SUB) {
+        bool IsRspAdj = IsArm64ECNative && (DestinationIsGuestRSP(CodeNode) ||
+                        (Op->Src1.IsImmediate() && FEXCore::IR::PhysicalRegister(Op->Src1).AsRegClass() == FEXCore::IR::RegClass::GPRFixed &&
+                         FEXCore::IR::PhysicalRegister(Op->Src1).Reg == 4));
+        if (IROp->Op != FEXCore::IR::OP_SUB && !IsRspAdj) {
           PackNZCVFromAddSub(A, B, R, OpSize, true);
+          UnconsumedNonRspFlags = true;
         }
         if (IROp->Op != FEXCore::IR::OP_SUBNZCV) {
           StoreGPRDest(CodeNode, R);
@@ -969,8 +1325,10 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << Sub1 << " = sub i64 " << A << ", " << B << "\n";
         OS << "  " << R << " = sub i64 " << Sub1 << ", " << Borrow << "\n";
         R = MaskToOpSize(R, OpSize);
+        UnconsumedNonRspFlags = false;
         if (IROp->Op != FEXCore::IR::OP_SBB) {
           PackNZCVFromAddSub(A, B, R, OpSize, true);
+          UnconsumedNonRspFlags = !DestinationIsGuestRSP(CodeNode);
         }
         if (IROp->Op != FEXCore::IR::OP_SBBNZCV) {
           StoreGPRDest(CodeNode, R);
@@ -991,8 +1349,10 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << Add1 << " = add i64 " << A << ", " << B << "\n";
         OS << "  " << R << " = add i64 " << Add1 << ", " << CBit << "\n";
         R = MaskToOpSize(R, OpSize);
+        UnconsumedNonRspFlags = false;
         if (IROp->Op != FEXCore::IR::OP_ADC) {
           PackNZCVFromAddSub(A, B, R, OpSize, false);
+          UnconsumedNonRspFlags = !DestinationIsGuestRSP(CodeNode);
         }
         if (IROp->Op != FEXCore::IR::OP_ADCNZCV) {
           StoreGPRDest(CodeNode, R);
@@ -1010,8 +1370,10 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << CBit << " = and i64 " << CSh << ", 1\n";
         OS << "  " << R << " = add i64 " << A << ", " << CBit << "\n";
         R = MaskToOpSize(R, OpSize);
+        UnconsumedNonRspFlags = false;
         if (IROp->Op == FEXCore::IR::OP_ADCZEROWITHFLAGS) {
           PackNZCVFromAddSub(A, CBit, R, OpSize, false);
+          UnconsumedNonRspFlags = true;
         }
         StoreGPRDest(CodeNode, R);
         break;
@@ -1022,6 +1384,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << NZCV << " = load i64, ptr %nzcv_reg, align 8\n";
         OS << "  " << Flipped << " = xor i64 " << NZCV << ", " << (1ULL << 29) << "\n";
         OS << "  store i64 " << Flipped << ", ptr %nzcv_reg, align 8\n";
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -1040,6 +1403,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << KeptOld << " = and i64 " << OldNZCV << ", " << static_cast<int64_t>(~MaskBits) << "\n";
         OS << "  " << NewNZCV << " = or i64 " << KeptOld << ", " << MaskedNew << "\n";
         OS << "  store i64 " << NewNZCV << ", ptr %nzcv_reg, align 8\n";
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -1059,6 +1423,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << ZS << " = shl i64 " << Z64 << ", 30\n";
         OS << "  " << OrNZ << " = or i64 " << NS << ", " << ZS << "\n";
         OS << "  store i64 " << OrNZ << ", ptr %nzcv_reg, align 8\n";
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -1070,6 +1435,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         R = MaskToOpSize(R, OpSize);
         if (Op->Cond != FEXCore::IR::CondClass::AL) {
           PackNZCVFromAddSub("0", Src, R, OpSize, true);
+          UnconsumedNonRspFlags = true;
         }
         StoreGPRDest(CodeNode, R);
         break;
@@ -1195,6 +1561,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  store i64 " << ZS << ", ptr %nzcv_reg, align 8\n";
         OS << "  " << R << " = select i1 " << ZBit << ", i64 0, i64 " << A << "\n";
         StoreGPRDest(CodeNode, R);
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -1224,6 +1591,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
           OS << "  " << ZS << " = shl i64 " << Z64 << ", 30\n";
           OS << "  " << OrNZ << " = or i64 " << NS << ", " << ZS << "\n";
           OS << "  store i64 " << OrNZ << ", ptr %nzcv_reg, align 8\n";
+          UnconsumedNonRspFlags = !DestinationIsGuestRSP(CodeNode);
         }
         if (IROp->Op != FEXCore::IR::OP_TESTNZ) {
           StoreGPRDest(CodeNode, R);
@@ -1420,6 +1788,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_NZCVSELECT: {
         auto* Op = IROp->C<FEXCore::IR::IROp_NZCVSelect>();
         std::string CondBit = EvaluateNZCVCond(Op->Cond);
+        UnconsumedNonRspFlags = false;
         std::string TV = LoadGPROperand(Op->TrueVal);
         std::string FV = LoadGPROperand(Op->FalseVal);
         std::string R = NextVal();
@@ -1431,6 +1800,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_NZCVSELECTINCREMENT: {
         auto* Op = IROp->C<FEXCore::IR::IROp_NZCVSelectIncrement>();
         std::string CondBit = EvaluateNZCVCond(Op->Cond);
+        UnconsumedNonRspFlags = false;
         std::string TV = LoadGPROperand(Op->TrueVal);
         std::string FV = LoadGPROperand(Op->FalseVal);
         std::string FVInc = NextVal(), R = NextVal();
@@ -1494,6 +1864,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << TrueNZCV << " = load i64, ptr %nzcv_reg, align 8\n";
         OS << "  " << SelNZCV << " = select i1 " << CondBit << ", i64 " << TrueNZCV << ", i64 " << FalseNZCV << "\n";
         OS << "  store i64 " << SelNZCV << ", ptr %nzcv_reg, align 8\n";
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -1506,10 +1877,12 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_UMULL:
       case FEXCore::IR::OP_SMULL: {
         auto* Op = IROp->C<FEXCore::IR::IROp_UMull>();
+        std::string Src1 = LoadGPROperand(Op->Src1);
+        std::string Src2 = LoadGPROperand(Op->Src2);
         std::string A32 = NextVal(), B32 = NextVal(), A64 = NextVal(), B64 = NextVal(), R = NextVal();
         const char* ExtOp = (IROp->Op == FEXCore::IR::OP_SMULL) ? "sext" : "zext";
-        OS << "  " << A32 << " = trunc i64 " << LoadGPROperand(Op->Src1) << " to i32\n";
-        OS << "  " << B32 << " = trunc i64 " << LoadGPROperand(Op->Src2) << " to i32\n";
+        OS << "  " << A32 << " = trunc i64 " << Src1 << " to i32\n";
+        OS << "  " << B32 << " = trunc i64 " << Src2 << " to i32\n";
         OS << "  " << A64 << " = " << ExtOp << " i32 " << A32 << " to i64\n";
         OS << "  " << B64 << " = " << ExtOp << " i32 " << B32 << " to i64\n";
         OS << "  " << R << " = mul i64 " << A64 << ", " << B64 << "\n";
@@ -1672,6 +2045,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << TrueNZCV << " = load i64, ptr %nzcv_reg, align 8\n";
         OS << "  " << SelNZCV << " = select i1 " << CondBit << ", i64 " << TrueNZCV << ", i64 " << FalseNZCV << "\n";
         OS << "  store i64 " << SelNZCV << ", ptr %nzcv_reg, align 8\n";
+        UnconsumedNonRspFlags = true;
         break;
       }
 
@@ -2193,6 +2567,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string CondBit;
         if (Op->FromNZCV) {
           CondBit = EvaluateNZCVCond(Op->Cond);
+          UnconsumedNonRspFlags = false;
         } else {
           std::string C1 = LoadGPROperand(Op->Cmp1);
           std::string C2 = LoadGPROperand(Op->Cmp2);
@@ -2270,7 +2645,6 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string IndirectRipVal = Site.IsDirect ? "0" : LoadGPROperand(Op->NewRIP);
         Result.ExitSites.push_back(Site);
 
-        // Pin all live-out SRA registers and emit the 4-byte exit site marker .inst (0x5000 + ExitId)
         std::string OutGprs[18];
         for (int i = 0; i < 18; ++i) {
           OutGprs[i] = NextVal();
@@ -2293,18 +2667,37 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
              << "    <2 x i64> " << OutFprs[12] << ", <2 x i64> " << OutFprs[13] << ", <2 x i64> " << OutFprs[14] << ", <2 x i64> " << OutFprs[15] << ")\n";
         }
 
-        std::string OutNzcv = NextVal();
-        OS << "  " << OutNzcv << " = load i64, ptr %nzcv_reg, align 8\n";
         uint32_t MarkerInst = 0x00005000u | (Site.ExitId & 0x0FFFu);
         char MarkerHex[32];
         snprintf(MarkerHex, sizeof(MarkerHex), "0x%08x", MarkerInst);
-        OS << "  call void asm sideeffect \"msr nzcv, x10 ; .inst " << MarkerHex << "\", "
-              "\"{x8},{x0},{x1},{x27},{x23},{fp},{x25},{x26},{x2},{x3},{x4},{x5},{x19},{x20},{x21},{x22},{x9},{x24},{x17},{x16},{x10},~{memory}\"(\n"
-           << "    i64 " << OutGprs[0] << ", i64 " << OutGprs[1] << ", i64 " << OutGprs[2] << ", i64 " << OutGprs[3] << ",\n"
-           << "    i64 " << OutGprs[4] << ", i64 " << OutGprs[5] << ", i64 " << OutGprs[6] << ", i64 " << OutGprs[7] << ",\n"
-           << "    i64 " << OutGprs[8] << ", i64 " << OutGprs[9] << ", i64 " << OutGprs[10] << ", i64 " << OutGprs[11] << ",\n"
-           << "    i64 " << OutGprs[12] << ", i64 " << OutGprs[13] << ", i64 " << OutGprs[14] << ", i64 " << OutGprs[15] << ",\n"
-           << "    i64 " << OutGprs[16] << ", i64 " << OutGprs[17] << ", i64 " << OutCrsp << ", i64 " << IndirectRipVal << ", i64 " << OutNzcv << ")\n";
+
+        // Target-specialized exit ABI lowering:
+        // In ARM64EC_NATIVE mode, across standard Call and Return exits where no unconsumed
+        // non-RSP flags are live-out, RFLAGS (NZCV) is caller-saved (killed by the ABI / RSP epilogue).
+        // Omitting the dead `%nzcv_reg` load and `msr nzcv, x10` lets LLVM's SROA/InstCombine/ADCE
+        // fold `PackNZCVFromAddSub` + `EvaluateNZCVCond` into a single native AArch64 `cmp` + `b.cond`
+        // and completely delete dead epilogue flag packing!
+        const bool IsCallOrRet = (Op->Hint == FEXCore::IR::BranchHint::Call ||
+                                  Op->Hint == FEXCore::IR::BranchHint::Return);
+        if (IsArm64ECNative && IsCallOrRet && !UnconsumedNonRspFlags) {
+          OS << "  call void asm sideeffect \".inst " << MarkerHex << "\", "
+                "\"{x8},{x0},{x1},{x27},{x23},{fp},{x25},{x26},{x2},{x3},{x4},{x5},{x19},{x20},{x21},{x22},{x17},{x16},~{memory}\"(\n"
+             << "    i64 " << OutGprs[0] << ", i64 " << OutGprs[1] << ", i64 " << OutGprs[2] << ", i64 " << OutGprs[3] << ",\n"
+             << "    i64 " << OutGprs[4] << ", i64 " << OutGprs[5] << ", i64 " << OutGprs[6] << ", i64 " << OutGprs[7] << ",\n"
+             << "    i64 " << OutGprs[8] << ", i64 " << OutGprs[9] << ", i64 " << OutGprs[10] << ", i64 " << OutGprs[11] << ",\n"
+             << "    i64 " << OutGprs[12] << ", i64 " << OutGprs[13] << ", i64 " << OutGprs[14] << ", i64 " << OutGprs[15] << ",\n"
+             << "    i64 " << OutCrsp << ", i64 " << IndirectRipVal << ")\n";
+        } else {
+          std::string OutNzcv = NextVal();
+          OS << "  " << OutNzcv << " = load i64, ptr %nzcv_reg, align 8\n";
+          OS << "  call void asm sideeffect \"msr nzcv, x10 ; .inst " << MarkerHex << "\", "
+                "\"{x8},{x0},{x1},{x27},{x23},{fp},{x25},{x26},{x2},{x3},{x4},{x5},{x19},{x20},{x21},{x22},{x9},{x24},{x17},{x16},{x10},~{memory}\"(\n"
+             << "    i64 " << OutGprs[0] << ", i64 " << OutGprs[1] << ", i64 " << OutGprs[2] << ", i64 " << OutGprs[3] << ",\n"
+             << "    i64 " << OutGprs[4] << ", i64 " << OutGprs[5] << ", i64 " << OutGprs[6] << ", i64 " << OutGprs[7] << ",\n"
+             << "    i64 " << OutGprs[8] << ", i64 " << OutGprs[9] << ", i64 " << OutGprs[10] << ", i64 " << OutGprs[11] << ",\n"
+             << "    i64 " << OutGprs[12] << ", i64 " << OutGprs[13] << ", i64 " << OutGprs[14] << ", i64 " << OutGprs[15] << ",\n"
+             << "    i64 " << OutGprs[16] << ", i64 " << OutGprs[17] << ", i64 " << OutCrsp << ", i64 " << IndirectRipVal << ", i64 " << OutNzcv << ")\n";
+        }
         OS << "  ret void\n";
         BlockTerminated = true;
         break;
@@ -2362,6 +2755,9 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
   Block.GuestSize = static_cast<uint32_t>(Lifted.GuestSize);
   Block.GuestInstCount = Lifted.GuestInstCount;
   Block.BasicBlockCount = Lifted.BasicBlockCount;
+  Block.TargetABI = Lifted.TargetABI;
+  Block.Safety = Lifted.Safety;
+  Block.GuestOpcodes = Lifted.GuestOpcodes;
   Block.SymbolName = Lifted.FunctionName;
 
   // Step 1: Parse 32-bit AArch64 words from RawFuncBytes and compact out trailing `ret` (0xd65f03c0)
@@ -2380,6 +2776,7 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
   if (!RawWords.empty() && (RawWords[0] & 0xFF8003FFu) == 0xD10003FFu) {
     // RawWords[0] is `sub sp, sp, #imm12`; construct matching `add sp, sp, #imm12`
     HostSpAddImmWord = (RawWords[0] & 0x007FFC00u) | 0x910003FFu;
+    Block.HostStackAdjustBytes = static_cast<uint16_t>((RawWords[0] >> 10) & 0xFFFu);
   }
 
   auto ShouldStripWord = [&](size_t i) -> bool {
@@ -2471,14 +2868,16 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
   Block.EntryPoints.push_back({Lifted.GuestEntryVA, EntryPointOffsetInBlock});
 
   // adr x10, #-4 (points back to offset 0, the JITCodeHeader)
-  // AArch64 ADR encoding for imm = -4 (21-bit signed -4 = 0x1FFFFC -> immlo = 0b00, immhi = 0x7ffff, Rd = 10):
-  // [31]=0, [30:29]=00, [28:24]=10000, [23:5]=0x7ffff, [4:0]=01010 -> 0x10ffffea
   EmitU32(0x10FFFFEAu);
   // str x10, [x28, #offsetof(CPUState, InlineJITBlockHeader)]
   const uint32_t InlineHeaderOff = static_cast<uint32_t>(offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
   const uint32_t Imm12 = (InlineHeaderOff / 8) & 0xFFFu;
-  // AArch64 STR (unsigned offset, 64-bit): 0xF9000000 | (Imm12 << 10) | (Rn=28 << 5) | Rt=10
   EmitU32(0xF9000000u | (Imm12 << 10) | (28u << 5) | 10u);
+
+  if (Lifted.TargetABI == AOTTargetABI::ARM64EC_NATIVE) {
+    // Also record the fast intra-module .text_ec entry point (offset 12)
+    Block.EntryPoints.push_back({Lifted.GuestEntryVA, static_cast<uint32_t>(Buf.size())});
+  }
 
   // 3. Emit CompactWords, recording where each `.inst (0x5000 + ExitId)` marker sits
   struct PendingExitBranch {
@@ -2581,7 +2980,7 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
       if (HostSpAddImmWord != 0) {
         EmitU32(HostSpAddImmWord);
       }
-      // Fast call-ret shadow stack pop + L1 cache fallback:
+      // Fast call-ret shadow stack pop + L1/DispatcherLoopTop fallback:
       // ldp x10, x11, [x17], #16   (0xA8C12E2Au)
       // sub x10, x10, x16          (0xCB10014Au) -- non-flag-setting SUB so NZCV is preserved across RET!
       // cbnz x10, #8               (0xB500004Au)
@@ -2594,7 +2993,9 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
       EmitU32(0xB500004Au);
       EmitU32(0xD65F0160u);
       const uint32_t RipOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.rip)) / 8) & 0xFFFu;
-      const uint32_t LoopOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop)) / 8) & 0xFFFu;
+      const bool IsGVisorEnv = Opts.UseGVisorOffset || (getenv("FEX_AOT_GVISOR_OFFSET") != nullptr);
+      const uint32_t LoopOffsetBytes = IsGVisorEnv ? 0xB60u : static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+      const uint32_t LoopOff = (LoopOffsetBytes / 8) & 0xFFFu;
       EmitU32(0xF9000000u | (RipOff << 10) | (28u << 5) | 16u);
       EmitU32(0xF9400000u | (LoopOff << 10) | (28u << 5) | 11u);
       EmitU32(0xD61F0160u);
@@ -2609,7 +3010,9 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
       // Push zeroed entry onto REG_CALLRET_SP (x17) so indirect callee `ret` pops a balanced shadow stack
       EmitU32(0xA9BF7E3Fu);
       const uint32_t RipOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.rip)) / 8) & 0xFFFu;
-      const uint32_t LoopOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop)) / 8) & 0xFFFu;
+      const bool IsGVisorEnv = Opts.UseGVisorOffset || (getenv("FEX_AOT_GVISOR_OFFSET") != nullptr);
+      const uint32_t LoopOffsetBytes = IsGVisorEnv ? 0xB60u : static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+      const uint32_t LoopOff = (LoopOffsetBytes / 8) & 0xFFFu;
       EmitU32(0xF9000000u | (RipOff << 10) | (28u << 5) | 16u);
       EmitU32(0xF9400000u | (LoopOff << 10) | (28u << 5) | 11u);
       EmitU32(0xD61F0160u);
@@ -2625,7 +3028,9 @@ LLVMArm64ECAOTCompiler::WrapLLVMCodeInFEXBlock(const LiftedFunctionIR& Lifted,
       EmitU32(HostSpAddImmWord);
     }
     const uint32_t RipOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.rip)) / 8) & 0xFFFu;
-    const uint32_t LoopOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop)) / 8) & 0xFFFu;
+    const bool IsGVisorEnv = Opts.UseGVisorOffset || (getenv("FEX_AOT_GVISOR_OFFSET") != nullptr);
+    const uint32_t LoopOffsetBytes = IsGVisorEnv ? 0xB60u : static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+    const uint32_t LoopOff = (LoopOffsetBytes / 8) & 0xFFFu;
     EmitU32(0xF9000000u | (RipOff << 10) | (28u << 5) | 16u);
     EmitU32(0xF9400000u | (LoopOff << 10) | (28u << 5) | 11u);
     EmitU32(0xD61F0160u);
@@ -2774,7 +3179,7 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
   std::ostringstream ModIR;
   ModIR << "target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32\"\n";
   ModIR << "target triple = \"" << Opts.TargetTriple << "\"\n\n";
-  ModIR << "%SRAState = type { i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64 }\n";
+  ModIR << "%SRAState = type { i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64 }\n%SRAStateEC = type { i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64 }\n";
   ModIR << "%SRAFPRState = type { <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, "
            "<2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64> }\n\n";
   rellume::x86_64::EmitIntrinsicDeclarations(ModIR);
@@ -2783,7 +3188,7 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
     ModIR << Fn.LLVMIRBody;
   }
 
-  // Also emit representative Arm64EC external call signatures so LLVM's AArch64Arm64ECCallLowering
+  // Emit representative Arm64EC external call signatures so LLVM's AArch64Arm64ECCallLowering
   // generates standard Arm64EC entry and exit thunks ($ientry_thunk$cdecl$..., $iexit_thunk$cdecl$...)
   if (Opts.EmitArm64ECThunks) {
     ModIR << "declare i64 @arm64ec_import_i64_i64_i64(i64, i64)\n";
@@ -2796,7 +3201,11 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
     ModIR << "}\n\n";
   }
 
+  // Attribute #0: FEX_SRA tier (.text_fex)
+  // Attribute #1: ARM64EC_NATIVE tier (.text_ec)
   ModIR << "attributes #0 = { nounwind \"no_callee_saved_registers\" \"frame-pointer\"=\"none\" "
+           "\"target-features\"=\"+neon,+crc,+lse,+rdm,+dotprod,+flagm,+altnzcv,+fptoint,+reserve-x18,+reserve-x28\" }\n";
+  ModIR << "attributes #1 = { nounwind \"no_callee_saved_registers\" \"frame-pointer\"=\"none\" "
            "\"target-features\"=\"+neon,+crc,+lse,+rdm,+dotprod,+flagm,+altnzcv,+fptoint,+reserve-x18,+reserve-x28\" }\n";
 
   const std::string FullIRText = ModIR.str();
@@ -2809,7 +3218,8 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
   LLVMModuleRef Mod = nullptr;
   char* ErrMsg = nullptr;
   if (LLVMParseIRInContext(Ctx, MemBuf, &Mod, &ErrMsg) != 0) {
-    fprintf(stderr, "LLVMParseIRInContext failed: %s\n", ErrMsg ? ErrMsg : "unknown"); LogMan::Msg::EFmt("LLVMParseIRInContext failed: {}", ErrMsg ? ErrMsg : "unknown");
+    fprintf(stderr, "LLVMParseIRInContext failed: %s\n", ErrMsg ? ErrMsg : "unknown");
+    LogMan::Msg::EFmt("LLVMParseIRInContext failed: {}", ErrMsg ? ErrMsg : "unknown");
     if (ErrMsg) LLVMDisposeMessage(ErrMsg);
     LLVMContextDispose(Ctx);
     return false;
@@ -2854,7 +3264,7 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
   auto TEnd = std::chrono::steady_clock::now();
   OutBatchCompileMs = std::chrono::duration<double, std::milli>(TEnd - TStart).count();
 
-  // Extract compiled per-function sections and .wowthk$aa thunks from the emitted COFF object
+  // Extract compiled per-function sections (.text_ec$*, .text_fex$*) and .wowthk$aa thunks from the emitted COFF object
   const uint8_t* ObjData = reinterpret_cast<const uint8_t*>(LLVMGetBufferStart(ObjBuf));
   const size_t ObjSize = LLVMGetBufferSize(ObjBuf);
 
@@ -2949,7 +3359,6 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
       const RawCOFFSymbol& S = Syms[i];
       std::string SName = GetCOFFSymName(S);
       if (S.SectionNumber > 0 && S.SectionNumber <= int16_t(FileHdr->NumberOfSections)) {
-        // Ignore section-name symbols (StorageClass == 3 and Value == 0 and Type == 0) when computing function bounds
         if (!SName.empty() && !(S.StorageClass == 3 && S.Value == 0 && S.Type == 0)) {
           ParsedSyms.push_back({SName, S.SectionNumber, S.Value, S.StorageClass, S.Type});
           SecSymbolOffsets[S.SectionNumber].push_back(S.Value);
@@ -2992,6 +3401,53 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
       Thk.IsEntryThunk = Sym.Name.starts_with("$ientry_thunk$");
       OutThunks.push_back(std::move(Thk));
     }
+  }
+
+  // Add our hybrid FEX<->Arm64EC dispatch & SEH helper thunks to OutThunks (.wowthk section):
+  // 1. __fex_ec_to_sra_adapter: Synchronizes Arm64EC stack/registers and dispatches to FEX DispatcherLoopTop (0xB60)
+  // 2. __fex_sra_to_ec_adapter: Synchronizes FEX SRA x23 -> sp and invokes target Arm64EC function in x11
+  // 3. __os_arm64x_check_icall_cfg: Indirect call target validator for hybrid .text_ec / .text_fex targets
+  {
+    Arm64ECThunkRecord EcToSra {};
+    EcToSra.Name = "__fex_ec_to_sra_adapter";
+    EcToSra.IsEntryThunk = false;
+    const uint32_t RipOff = (static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, State.rip)) / 8) & 0xFFFu;
+    const bool IsGVisorEnv = Opts.UseGVisorOffset || (getenv("FEX_AOT_GVISOR_OFFSET") != nullptr);
+    const uint32_t LoopOffsetBytes = IsGVisorEnv ? 0xB60u : static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+    const uint32_t LoopOff = (LoopOffsetBytes / 8) & 0xFFFu;
+    uint32_t Words1[4] = {
+      0xA9BF7E3Fu, // stp xzr, xzr, [x17, #-16]!
+      0xF9000000u | (RipOff << 10) | (28u << 5) | 16u, // str x16, [x28, #State.rip]
+      0xF9400000u | (LoopOff << 10) | (28u << 5) | 11u, // ldr x11, [x28, #Pointers.DispatcherLoopTop]
+      0xD61F0160u  // br x11
+    };
+    EcToSra.Bytes.resize(sizeof(Words1));
+    memcpy(EcToSra.Bytes.data(), Words1, sizeof(Words1));
+    OutThunks.push_back(std::move(EcToSra));
+
+    Arm64ECThunkRecord SraToEc {};
+    SraToEc.Name = "__fex_sra_to_ec_adapter";
+    SraToEc.IsEntryThunk = true;
+    const uint32_t EnterEcOff = (0xB70u / 8u) & 0xFFFu;
+    uint32_t Words2[3] = {
+      0x910002E9u, // mov x9, x23 (preserve guest RSP)
+      0xF9400000u | (EnterEcOff << 10) | (28u << 5) | 11u, // ldr x11, [x28, #Pointers.DispatcherLoopTopEnterEC]
+      0xD61F0160u  // br x11
+    };
+    SraToEc.Bytes.resize(sizeof(Words2));
+    memcpy(SraToEc.Bytes.data(), Words2, sizeof(Words2));
+    OutThunks.push_back(std::move(SraToEc));
+
+    Arm64ECThunkRecord IcallCfg {};
+    IcallCfg.Name = "__os_arm64x_check_icall_cfg";
+    IcallCfg.IsEntryThunk = false;
+    uint32_t Words3[2] = {
+      0xAA0B03F0u, // mov x16, x11
+      0xD65F03C0u  // ret
+    };
+    IcallCfg.Bytes.resize(sizeof(Words3));
+    memcpy(IcallCfg.Bytes.data(), Words3, sizeof(Words3));
+    OutThunks.push_back(std::move(IcallCfg));
   }
 
   OutBlocks.reserve(LiftedFunctions.size());

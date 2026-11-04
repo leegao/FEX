@@ -32,6 +32,12 @@ install(TARGETS FEXOfflineCompiler RUNTIME
   COMPONENT Runtime)
 
 if (NOT MINGW)
-  add_executable(fex-aot-pe EXCLUDE_FROM_ALL FEXAOTPECompiler.cpp)
+  add_executable(fex-aot-pe EXCLUDE_FROM_ALL
+    FEXAOTPECompiler.cpp
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVMArm64ECAOT.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/PECOFFContainer.cpp")
+  target_include_directories(fex-aot-pe PRIVATE
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/IncludePrivate")
   target_link_libraries(fex-aot-pe PRIVATE FEXCore FEXCore_Base JemallocDummy fmt::fmt xxHash::xxhash cephes_128bit softfloat_3e LLVM ${PTHREAD_LIB} dl atomic)
 endif()

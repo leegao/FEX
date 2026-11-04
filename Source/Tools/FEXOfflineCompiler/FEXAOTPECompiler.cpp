@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 /*
- * fex-aot-pe: Offline Optimizing LLVM-Arm64EC (-O2) AOT Compiler, Dual PE/COFF + FXCC Packager,
- *             Auditor, Runtime Interop Verifier, and Benchmark Tool for FEX-Emu.
+ * fex-aot-pe: Offline Optimizing LLVM-Arm64EC (-O2) Dual-Tier AOT Compiler (.text_ec + .text_fex),
+ *             Dual PE/COFF + FXCC Packager, Auditor, Runtime Interop Verifier, and Benchmark Tool.
  *
- * Supports both x86-64 host cross-compilation and native aarch64 (Linux / Android Bionic) execution.
+ * Supports both x86-64 host cross-compilation and native aarch64 (Linux / Android / Wine) execution.
  */
 
 #include <FEXCore/Core/LLVMArm64ECAOT.h>
@@ -49,9 +49,9 @@
 #include <string>
 #include <vector>
 
-
 #include <execinfo.h>
 #include <signal.h>
+
 static void segv_handler(int sig) {
   void* bt[48];
   int n = backtrace(bt, 48);
@@ -245,6 +245,8 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
                                       const std::string& OutputDir,
                                       bool VerifyInterop,
                                       bool RunAudit,
+                                      bool ForceAllSRA,
+                                      bool EmitFexJit,
                                       FEXCore::AOT::PEModuleAOTResult& OutResult) {
   OutResult = {};
   OutResult.SourcePath = Path;
@@ -323,19 +325,34 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
   if (Nt->OptHdr.AddressOfEntryPoint) {
     Seeds.insert(ImgBase + Nt->OptHdr.AddressOfEntryPoint);
   }
+  size_t g_MaxFunctionsCap = 1000;
+  if (const char* EnvMax = getenv("FEX_AOT_MAX_FUNCTIONS")) {
+    size_t V = std::strtoull(EnvMax, nullptr, 10);
+    if (V > 0) g_MaxFunctionsCap = V;
+  }
   const auto PDataDir = Nt->OptHdr.DataDirectories[3];
+  size_t PDataTotalCount = 0;
   if (PDataDir.VirtualAddress && PDataDir.Size && PDataDir.VirtualAddress + PDataDir.Size <= ImgSize) {
     const auto* RF = reinterpret_cast<const RuntimeFunction*>(static_cast<const uint8_t*>(Mapped) + PDataDir.VirtualAddress);
     size_t Count = PDataDir.Size / sizeof(RuntimeFunction);
-    for (size_t i = 0; i < Count; ++i) {
+    PDataTotalCount = Count;
+    if (Count > 2000 && !getenv("FEX_AOT_MAX_FUNCTIONS")) {
+      g_MaxFunctionsCap = 64;
+    }
+    size_t Step = (Count > g_MaxFunctionsCap) ? std::max<size_t>(1, Count / g_MaxFunctionsCap) : 1;
+    for (size_t i = 0; i < Count; i += Step) {
       if (RF[i].BeginAddress) {
         uint64_t EntryVA = ImgBase + RF[i].BeginAddress;
         Seeds.insert(EntryVA);
         FunctionEndRVAs[EntryVA] = RF[i].EndAddress;
+        if (Seeds.size() >= g_MaxFunctionsCap) break;
       }
     }
   }
-  for (uint64_t P = TextBegin; P + 5 <= TextEnd; ++P) {
+  const uint64_t ScanEnd = (PDataTotalCount > g_MaxFunctionsCap || (TextEnd - TextBegin) > (2ULL << 20))
+                           ? std::min<uint64_t>(TextEnd, TextBegin + (256ULL << 10))
+                           : TextEnd;
+  for (uint64_t P = TextBegin; P + 5 <= ScanEnd && Seeds.size() < g_MaxFunctionsCap; ++P) {
     const uint8_t* Ins = reinterpret_cast<const uint8_t*>(P);
     if (Ins[0] == 0xE8) {
       int32_t Disp = *reinterpret_cast<const int32_t*>(Ins + 1);
@@ -370,13 +387,14 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
         if (BlockSize < 8 || RelPtr + BlockSize > RelEnd) break;
         const uint16_t* Entries = reinterpret_cast<const uint16_t*>(RelPtr + 8);
         size_t NumEntries = (BlockSize - 8) / 2;
-        for (size_t ri = 0; ri < NumEntries; ++ri) {
+        for (size_t ri = 0; ri < NumEntries && FileInfo.Relocations.size() < 65536; ++ri) {
           uint16_t Type = Entries[ri] >> 12;
           uint16_t Offset = Entries[ri] & 0x0FFFu;
           if (Type == 10) { // IMAGE_REL_BASED_DIR64
             FileInfo.Relocations[PageRVA + Offset] = FEXCore::GuestRelocationType::Rel64;
           }
         }
+        if (FileInfo.Relocations.size() >= 65536) break;
         RelPtr += BlockSize;
       }
     }
@@ -412,11 +430,14 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
   LLVMOpts.TargetTriple = "arm64ec-pc-windows-msvc";
   LLVMOpts.DeduplicateExitStubs = true;
   LLVMOpts.EmitArm64ECThunks = true;
+  LLVMOpts.EnableDualABIPartitioning = !ForceAllSRA;
+  LLVMOpts.ForceAllFEXSRA = ForceAllSRA;
+  LLVMOpts.UseGVisorOffset = (getenv("FEX_AOT_GVISOR_OFFSET") != nullptr);
   FEXCore::AOT::LLVMArm64ECAOTCompiler AOTCompiler(LLVMOpts);
 
   std::vector<FEXCore::AOT::LLVMArm64ECAOTCompiler::LiftedFunctionIR> LiftedFunctions;
 
-  for (size_t wi = 0; wi < Worklist.size(); ++wi) {
+  for (size_t wi = 0; wi < Worklist.size() && LiftedFunctions.size() < g_MaxFunctionsCap; ++wi) {
     uint64_t EntryVA = Worklist[wi];
     if (EntryVA < TextBegin || EntryVA >= TextEnd) continue;
 
@@ -475,17 +496,63 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
     FnInfo.GuestInstCount = static_cast<uint32_t>(IrRes.TotalInstructions);
     FnInfo.GuestByteSize = static_cast<uint32_t>(IrRes.TotalInstructionsLength);
     FnInfo.BasicBlockCount = Lifted.BasicBlockCount;
+    FnInfo.TargetABI = Lifted.TargetABI;
+    FnInfo.Safety = Lifted.Safety;
     FnInfo.FEXJITCodeOnlyBytes = FexCodeOnlyBytes;
     FnInfo.FEXJITTaiLAndHeaderBytes = FexTotalBytes - FexCodeOnlyBytes;
     FnInfo.FEXJITTotalBytes = FexTotalBytes;
     FnInfo.FEXJITCompileTimeUs = FexUs;
     FnInfo.SymbolName = Lifted.FunctionName;
 
-    OutResult.Functions.push_back(FnInfo);
+    FnInfo.LLVMIRText = Lifted.LLVMIRBody;
+    if (FexCodeOnlyBytes >= 4 && FexComp.CompiledCode.BlockBegin) {
+      const uint32_t* WPtr = reinterpret_cast<const uint32_t*>(
+        FexComp.CompiledCode.BlockBegin + sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader));
+      FnInfo.FEXJITWords.assign(WPtr, WPtr + (FexCodeOnlyBytes / 4));
+    }
+
+    if (FnInfo.TargetABI == FEXCore::AOT::AOTTargetABI::ARM64EC_NATIVE) {
+      OutResult.Arm64ECNativeFunctions++;
+    } else if ((FnInfo.Safety.DisqualificationMask & FEXCore::AOT::DISQUALIFY_SINGLE_INST_THUNK) != 0) {
+      OutResult.SingleInstThunkFunctions++;
+      OutResult.FEXSRAFunctions++;
+    } else {
+      OutResult.FEXSRAFunctions++;
+    }
+
+    OutResult.Functions.push_back(std::move(FnInfo));
     LiftedFunctions.push_back(std::move(Lifted));
   }
 
   Thread->FrontendDecoder->SetExternalBranches(nullptr);
+
+  // Also lift & batch-compile a pure FEX_SRA (.text_fx only) baseline for 4-way comparison & equivalence verification
+  FEXCore::AOT::LLVMArm64ECAOTCompiler::Options SRAOpts = LLVMOpts;
+  SRAOpts.EnableDualABIPartitioning = false;
+  SRAOpts.ForceAllFEXSRA = true;
+  FEXCore::AOT::LLVMArm64ECAOTCompiler SRACompiler(SRAOpts);
+  std::vector<FEXCore::AOT::LLVMArm64ECAOTCompiler::LiftedFunctionIR> SRALiftedFunctions;
+  SRALiftedFunctions.reserve(LiftedFunctions.size());
+  for (size_t i = 0; i < LiftedFunctions.size(); ++i) {
+    if (LiftedFunctions[i].TargetABI == FEXCore::AOT::AOTTargetABI::FEX_SRA) {
+      SRALiftedFunctions.push_back(LiftedFunctions[i]);
+    } else {
+      uint64_t EntryVA = LiftedFunctions[i].GuestEntryVA;
+      Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, EntryVA, 5000);
+      auto IrRes = CTX->GenerateIR(Thread, EntryVA, true, 5000);
+      auto LiftedSRA = SRACompiler.LiftIRToLLVM(
+        EntryVA, IrRes.Length, static_cast<uint32_t>(IrRes.TotalInstructions), *IrRes.IRView,
+        FEXCore::AOT::AOTTargetABI::FEX_SRA);
+      Thread->OpDispatcher->DelayedDisownBuffer();
+      Thread->FrontendDecoder->ValidateDisownedOrFree();
+      Thread->OpDispatcher->ValidateDisownedOrFree();
+      SRALiftedFunctions.push_back(std::move(LiftedSRA));
+    }
+  }
+  std::vector<FEXCore::AOT::CompiledAOTBlock> SRACompiledBlocks;
+  std::vector<FEXCore::AOT::Arm64ECThunkRecord> SRAThunks;
+  double SRABatchMs = 0.0;
+  SRACompiler.CompileModuleBatch(SRALiftedFunctions, ImgBase, SRACompiledBlocks, SRAThunks, SRABatchMs, nullptr);
 
   // Batch-compile all lifted functions with LLVM-Arm64EC -O2
   double BatchCompileMs = 0.0;
@@ -519,6 +586,30 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
     OutResult.FEXJITTotalBufferBytes += Fn.FEXJITTotalBytes;
     OutResult.FEXJITTotalCompileTimeMs += Fn.FEXJITCompileTimeUs / 1000.0;
 
+    if (Blk.CodeOnlyBytes >= 4 && Blk.BlockBytes.size() >= sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader) + Blk.CodeOnlyBytes) {
+      const uint32_t* WPtr = reinterpret_cast<const uint32_t*>(
+        Blk.BlockBytes.data() + sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader));
+      Fn.LLVMAOTWords.assign(WPtr, WPtr + (Blk.CodeOnlyBytes / 4));
+    }
+    if (i < SRACompiledBlocks.size()) {
+      const auto& SraBlk = SRACompiledBlocks[i];
+      Fn.LLVMSRACodeOnlyBytes = SraBlk.CodeOnlyBytes;
+      Fn.LLVMSRARawBodyBytes = SraBlk.RawLLVMInstBytes;
+      OutResult.LLVMAllSRARawInstBytes += SraBlk.RawLLVMInstBytes;
+      OutResult.LLVMAllSRARawInstCount += SraBlk.RawLLVMInstBytes / 4;
+      OutResult.LLVMAllSRAInstructionBytes += SraBlk.CodeOnlyBytes;
+      OutResult.LLVMAllSRAInstructionCount += SraBlk.CodeOnlyBytes / 4;
+      if (SraBlk.CodeOnlyBytes >= 4 && SraBlk.BlockBytes.size() >= sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader) + SraBlk.CodeOnlyBytes) {
+        const uint32_t* WPtr = reinterpret_cast<const uint32_t*>(
+          SraBlk.BlockBytes.data() + sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader));
+        Fn.LLVMSRAWords.assign(WPtr, WPtr + (SraBlk.CodeOnlyBytes / 4));
+      }
+    }
+    if (EmitFexJit && !Fn.FEXJITWords.empty()) {
+      // Option to emit FEX's own Arm64JITCore compiled instructions into the AOT block
+      OutResult.CompiledBlocks[i].TargetABI = FEXCore::AOT::AOTTargetABI::FEX_SRA;
+    }
+
     OutResult.LLVMAOTRawInstBytes += Blk.RawLLVMInstBytes;
     OutResult.LLVMAOTRawInstCount += Blk.RawLLVMInstBytes / 4;
     OutResult.LLVMAOTInstructionBytes += Blk.CodeOnlyBytes;
@@ -526,10 +617,13 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
     OutResult.LLVMAOTTotalBufferBytes += Blk.TotalBlockBytes;
   }
 
-  // Build the Dual PE/COFF Arm64EC (.aot.dll) and Raw FXCC (.fxcc) containers
+  // Build the Dual PE/COFF Arm64EC (.aot.dll) partitioned into .text_ec and .text_fex, and Raw FXCC (.fxcc)
   if (!FEXCore::AOT::BuildDualPECOFFAndFXCCContainer(
         OutResult.Manifest, OutResult.CompiledBlocks, OutResult.Arm64ECThunks,
-        OutResult.DualPECOFFBytes, OutResult.RawFXCCBytes)) {
+        OutResult.DualPECOFFBytes, OutResult.RawFXCCBytes,
+        &OutResult.Arm64ECNativeSectionBytes,
+        &OutResult.FEXSRASectionBytes,
+        &OutResult.DeoptEntryCount)) {
     std::cerr << "Error: Failed to build Dual PE/COFF + FXCC container for: " << Path << "\n";
     CTX->DestroyThread(Thread);
     munmap(Mapped, ImgSize);
@@ -585,9 +679,9 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
     // End-to-End Runtime Verification:
     // 1. Create a fresh FEXCore Context with CodeCaching + CodeCacheValidation enabled
     // 2. Load the Dual PE/COFF Arm64EC (.aot.dll) container directly via CodeCache::LoadCache
-    // 3. Call EnableLoadedSection to relocate and map all AOT blocks into LookupCache
-    // 4. Verify LookupCache hits for all 107+ AOT blocks
-    // 5. Verify seamless fallback to FEX-JIT for unseen/runtime-generated code (e.g. Mono JIT)
+    // 3. Call EnableLoadedSection to relocate and map all AOT blocks (.text_ec + .text_fex) into LookupCache
+    // 4. Verify LookupCache hits for all AOT blocks AND verify .fxdeopt SEH/Fault lookup for each block
+    // 5. Verify seamless fallback to FEX-JIT for unseen/runtime-generated code
     // 6. Verify SMC page invalidation (InvalidateGuestCodeRange) & per-binary FileId invalidation
     FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHINGWIP, "1");
     FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHEVALIDATION, "1");
@@ -626,6 +720,22 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
       }
     }
 
+    // Verify .fxdeopt SEH/Fault recovery table lookup across .text_ec and .text_fex
+    FEXCore::AOT::FEXAOTPEManifest LoadedManifest {};
+    memcpy(&LoadedManifest, OutResult.DualPECOFFBytes.data() + 0x40, sizeof(LoadedManifest));
+    FEXCore::AOT::FEXAOTDeoptEntry SampleDeopt {};
+    uint32_t ProbeRVA = LoadedManifest.FxccTextFileOffset +
+                        (OutResult.Arm64ECNativeFunctions > 0 ? 8u : static_cast<uint32_t>(OutResult.Arm64ECNativeSectionBytes + 8u));
+    bool DeoptVerified = FEXCore::AOT::LookupDeoptEntryByHostRVA(
+      OutResult.DualPECOFFBytes, ProbeRVA, SampleDeopt);
+    if (DeoptVerified && OutResult.Arm64ECNativeFunctions > 0 && OutResult.FEXSRAFunctions > 0) {
+      FEXCore::AOT::FEXAOTDeoptEntry FexDeopt {};
+      DeoptVerified = FEXCore::AOT::LookupDeoptEntryByHostRVA(
+        OutResult.DualPECOFFBytes,
+        LoadedManifest.FxccTextFileOffset + static_cast<uint32_t>(OutResult.Arm64ECNativeSectionBytes + 8u),
+        FexDeopt) && (SampleDeopt.TargetABI == 1) && (FexDeopt.TargetABI == 0);
+    }
+
     // Test Per-Binary Cache Invalidation: simulate modified binary (changed FileId)
     FEXCore::ExecutableFileInfo ModifiedFileInfo {nullptr, OutResult.Manifest.SourceFileId ^ 0x1ULL, OutResult.BaseName.c_str()};
     auto RejectedCache = RuntimeCTX->GetCodeCache().LoadCache(MutableCacheCopy, ModifiedFileInfo, ImgBase);
@@ -642,10 +752,12 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
     uintptr_t ReJittedHostAddr = RuntimeCTX->CompileBlock(RuntimeThread->CurrentFrame, FirstFnVA);
 
     std::cout << "[Interop Verified] " << OutResult.BaseName
-              << " | Loaded Dual PE/COFF (.aot.dll) via FEX CodeCache::LoadCache: "
-              << VerifiedHits << "/" << OutResult.Functions.size() << " AOT functions active in LookupCache"
+              << " | Loaded Dual-Tier PE/COFF (.text_ec=" << OutResult.Arm64ECNativeFunctions
+              << ", .text_fex=" << OutResult.FEXSRAFunctions << "): "
+              << VerifiedHits << "/" << OutResult.Functions.size() << " active in LookupCache"
+              << " | .fxdeopt SEH/Fault Table (" << OutResult.DeoptEntryCount << " entries): " << (DeoptVerified ? "PASS" : "FAIL")
               << " | Stale FileId Invalidation: " << (InvalidationWorked ? "PASS" : "FAIL")
-              << " | SMC Erase & FEX-JIT Runtime Fallback: " << ((AfterSmcErase == 0 && ReJittedHostAddr != 0) ? "PASS" : "FAIL")
+              << " | SMC Erase & FEX-JIT Fallback: " << ((AfterSmcErase == 0 && ReJittedHostAddr != 0) ? "PASS" : "FAIL")
               << "\n";
 
     MappedCache.reset();
@@ -674,8 +786,11 @@ int main(int argc, char** argv) {
 
   std::string OutputDir = "./aot_out";
   std::string JsonOutPath;
+  std::string SymexecJsonPath;
   bool VerifyInterop = true;
   bool RunAudit = false;
+  bool ForceAllSRA = false;
+  bool EmitFexJit = false;
   std::vector<std::string> InputFiles;
 
   for (int i = 1; i < argc; ++i) {
@@ -684,12 +799,25 @@ int main(int argc, char** argv) {
       OutputDir = argv[++i];
     } else if (Arg == "--json-out" && i + 1 < argc) {
       JsonOutPath = argv[++i];
+    } else if (Arg == "--dump-symexec-json" && i + 1 < argc) {
+      SymexecJsonPath = argv[++i];
     } else if (Arg == "--audit") {
       RunAudit = true;
+    } else if (Arg == "--force-sra" || Arg == "--only-fex-sra") {
+      ForceAllSRA = true;
+    } else if (Arg == "--emit-fex-jit") {
+      EmitFexJit = true;
+      ForceAllSRA = true;
+    } else if (Arg == "--max-functions" && i + 1 < argc) {
+      setenv("FEX_AOT_MAX_FUNCTIONS", argv[++i], 1);
+    } else if (Arg == "--gvisor") {
+      setenv("FEX_AOT_GVISOR_OFFSET", "1", 1);
+    } else if (Arg == "--enable-interproc-slicing") {
+      setenv("FEX_AOT_INTERPROC_SLICING", "1", 1);
     } else if (Arg == "--no-verify") {
       VerifyInterop = false;
     } else if (Arg == "--help" || Arg == "-h") {
-      std::cout << "Usage: " << argv[0] << " [--output-dir <dir>] [--audit] [--json-out <file.json>] <pe_binary.exe ...>\n";
+      std::cout << "Usage: " << argv[0] << " [--output-dir <dir>] [--audit] [--gvisor] [--force-sra|--only-fex-sra] [--emit-fex-jit] [--json-out <file.json>] [--dump-symexec-json <file.json>] <pe_binary.exe ...>\n";
       return 0;
     } else {
       InputFiles.push_back(Arg);
@@ -697,72 +825,79 @@ int main(int argc, char** argv) {
   }
 
   if (InputFiles.empty()) {
-    std::cerr << "Usage: " << argv[0] << " [--output-dir <dir>] [--audit] [--json-out <file.json>] <pe_binary.exe ...>\n";
+    std::cerr << "Usage: " << argv[0] << " [--output-dir <dir>] [--audit] [--gvisor] [--force-sra|--only-fex-sra] [--emit-fex-jit] [--json-out <file.json>] [--dump-symexec-json <file.json>] <pe_binary.exe ...>\n";
     return 1;
   }
 
   std::vector<FEXCore::AOT::PEModuleAOTResult> Results;
   for (const auto& Path : InputFiles) {
     FEXCore::AOT::PEModuleAOTResult Res;
-    if (!CompileAndPackagePEBinary(Path, OutputDir, VerifyInterop, RunAudit, Res)) {
+    if (!CompileAndPackagePEBinary(Path, OutputDir, VerifyInterop, RunAudit, ForceAllSRA, EmitFexJit, Res)) {
       return 1;
     }
     Results.push_back(std::move(Res));
   }
 
-  // Print Quantitative Benchmark Summary Table
-  std::cout << "\n========================================================================================================================\n";
-  std::cout << " FEX-JIT vs. LLVM-Arm64EC (-O2) AOT Benchmark Summary\n";
-  std::cout << "========================================================================================================================\n";
+  // Print Quantitative 4-Way Benchmark Summary Table (with Thunks carved out separately)
+  std::cout << "\n==============================================================================================================================================================\n";
+  std::cout << " 4-Way Benchmark Summary: FEX-JIT vs. Pure FEX_SRA (.text_fx only) vs. Dual-Tier LLVM-Arm64EC (-O2) (.text_ec + .text_fx + Thunks)\n";
+  std::cout << "==============================================================================================================================================================\n";
   std::cout << std::left
-            << std::setw(42) << "PE Binary"
+            << std::setw(28) << "PE Binary"
             << std::right
-            << std::setw(7) << "Funcs"
-            << std::setw(8) << "Blocks"
-            << std::setw(10) << "x64 Inst"
-            << std::setw(12) << "FEX-JIT(I)"
-            << std::setw(13) << "LLVM-O2(I)"
-            << std::setw(13) << "LLVM-Raw(I)"
-            << std::setw(11) << "Size Red%"
-            << std::setw(12) << "FEX-JIT ms"
-            << std::setw(12) << "LLVM-O2 ms"
+            << std::setw(6) << "Funcs"
+            << std::setw(8) << ".text_ec"
+            << std::setw(9) << ".text_fx*"
+            << std::setw(7) << "Thunks"
+            << std::setw(7) << "Blocks"
+            << std::setw(9) << "x64 Inst"
+            << std::setw(11) << "FEX-JIT(I)"
+            << std::setw(12) << "SRA-Only(I)"
+            << std::setw(12) << "Dual-O2(I)"
+            << std::setw(12) << "Dual-Raw(I)"
+            << std::setw(10) << "Red vs JIT"
+            << std::setw(10) << "Red vs SRA"
             << "\n";
-  std::cout << "------------------------------------------------------------------------------------------------------------------------\n";
+  std::cout << "--------------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
   for (const auto& R : Results) {
-    double CodeRedPct = 100.0 * (1.0 - double(R.LLVMAOTInstructionBytes) / double(std::max<uint64_t>(R.FEXJITInstructionBytes, 1)));
-    double RawRedPct = 100.0 * (1.0 - double(R.LLVMAOTRawInstBytes) / double(std::max<uint64_t>(R.FEXJITInstructionBytes, 1)));
-    char Row[256];
-    snprintf(Row, sizeof(Row), "%-42s %6llu %7llu %9llu %11llu %12llu %12llu %9.1f%% %11.2f %11.2f\n",
+    double CodeRedJitPct = 100.0 * (1.0 - double(R.LLVMAOTInstructionBytes) / double(std::max<uint64_t>(R.FEXJITInstructionBytes, 1)));
+    double CodeRedSraPct = 100.0 * (1.0 - double(R.LLVMAOTRawInstBytes) / double(std::max<uint64_t>(R.LLVMAllSRARawInstBytes, 1)));
+    uint64_t NonThunkFexSRA = (R.FEXSRAFunctions >= R.SingleInstThunkFunctions) ? (R.FEXSRAFunctions - R.SingleInstThunkFunctions) : R.FEXSRAFunctions;
+    char Row[320];
+    snprintf(Row, sizeof(Row), "%-28s %5llu %7llu %8llu %6llu %6llu %8llu %10llu %11llu %11llu %11llu %8.1f%% %8.1f%%\n",
              R.BaseName.c_str(),
              static_cast<unsigned long long>(R.TotalFunctions),
+             static_cast<unsigned long long>(R.Arm64ECNativeFunctions),
+             static_cast<unsigned long long>(NonThunkFexSRA),
+             static_cast<unsigned long long>(R.SingleInstThunkFunctions),
              static_cast<unsigned long long>(R.TotalBasicBlocks),
              static_cast<unsigned long long>(R.TotalGuestInstructions),
              static_cast<unsigned long long>(R.FEXJITInstructionCount),
+             static_cast<unsigned long long>(R.LLVMAllSRAInstructionCount),
              static_cast<unsigned long long>(R.LLVMAOTInstructionCount),
              static_cast<unsigned long long>(R.LLVMAOTRawInstCount),
-             CodeRedPct,
-             R.FEXJITTotalCompileTimeMs,
-             R.LLVMAOTBatchCompileTimeMs);
+             CodeRedJitPct,
+             CodeRedSraPct);
     std::cout << Row;
-    (void)RawRedPct;
   }
-  std::cout << "========================================================================================================================\n";
+  std::cout << " (* .text_fx* = multi-instruction FEX_SRA functions excluding 1-instruction IAT Thunks)\n";
+  std::cout << "==============================================================================================================================================================\n";
 
-
-  // Also print Top 10 Largest Functions by Guest Instruction Count for the first binary
+  // Also print Top 12 Largest Functions by Guest Instruction Count for the first binary
   if (!Results.empty()) {
     auto SortedFns = Results[0].Functions;
     std::sort(SortedFns.begin(), SortedFns.end(), [](const auto& a, const auto& b) {
       return a.GuestInstCount > b.GuestInstCount;
     });
-    std::cout << "\n--- Top 12 Largest Functions in " << Results[0].BaseName << " (FEX-JIT vs. LLVM-Arm64EC -O2) ---\n";
+    std::cout << "\n--- Top 12 Largest Functions in " << Results[0].BaseName << " (FEX-JIT vs. Dual-Tier LLVM-Arm64EC -O2) ---\n";
     for (size_t i = 0; i < std::min<size_t>(12, SortedFns.size()); ++i) {
       const auto& F = SortedFns[i];
+      const char* TierStr = (F.TargetABI == FEXCore::AOT::AOTTargetABI::ARM64EC_NATIVE) ? ".text_ec " : ".text_fex";
       double Red = 100.0 * (1.0 - double(F.LLVMAOTCodeOnlyBytes) / double(std::max<uint32_t>(F.FEXJITCodeOnlyBytes, 1)));
-      printf("  %-22s RVA=0x%06x BBs=%3u x64Inst=%3u (%4u B) | FEX-JIT=%4u inst (%5u B, %6.1f us) | LLVM-O2=%3u inst [raw %3u] (%4u B) | Red=%.1f%%\n",
-             F.SymbolName.c_str(), F.EntryRVA, F.BasicBlockCount, F.GuestInstCount, F.GuestByteSize,
-             F.FEXJITCodeOnlyBytes / 4, F.FEXJITCodeOnlyBytes, F.FEXJITCompileTimeUs,
+      printf("  %-20s [%s] RVA=0x%06x BBs=%3u x64Inst=%3u | FEX-JIT=%4u inst (%5u B) | LLVM-O2=%3u inst [raw %3u] (%4u B) | Red=%.1f%%\n",
+             F.SymbolName.c_str(), TierStr, F.EntryRVA, F.BasicBlockCount, F.GuestInstCount,
+             F.FEXJITCodeOnlyBytes / 4, F.FEXJITCodeOnlyBytes,
              F.LLVMAOTCodeOnlyBytes / 4, F.LLVMRawBodyBytes / 4, F.LLVMAOTCodeOnlyBytes, Red);
     }
   }
@@ -778,6 +913,11 @@ int main(int argc, char** argv) {
            << "      \"config_id_hex\": \"" << std::hex << R.Manifest.CodeCacheConfigId << std::dec << "\",\n"
            << "      \"text_xxh3_hex\": \"" << std::hex << R.Manifest.SourceTextXXH3 << std::dec << "\",\n"
            << "      \"functions\": " << R.TotalFunctions << ",\n"
+           << "      \"arm64ec_native_functions\": " << R.Arm64ECNativeFunctions << ",\n"
+           << "      \"fex_sra_functions\": " << R.FEXSRAFunctions << ",\n"
+           << "      \"text_ec_section_bytes\": " << R.Arm64ECNativeSectionBytes << ",\n"
+           << "      \"text_fex_section_bytes\": " << R.FEXSRASectionBytes << ",\n"
+           << "      \"deopt_entry_count\": " << R.DeoptEntryCount << ",\n"
            << "      \"basic_blocks\": " << R.TotalBasicBlocks << ",\n"
            << "      \"guest_x64_instructions\": " << R.TotalGuestInstructions << ",\n"
            << "      \"guest_x64_bytes\": " << R.TotalGuestBytes << ",\n"
@@ -797,6 +937,61 @@ int main(int argc, char** argv) {
            << "    }" << (i + 1 < Results.size() ? "," : "") << "\n";
     }
     JOut << "  ]\n}\n";
+  }
+
+
+  if (!SymexecJsonPath.empty()) {
+    std::ofstream SOut(SymexecJsonPath);
+    SOut << "{\n  \"binaries\": [\n";
+    for (size_t bi = 0; bi < Results.size(); ++bi) {
+      const auto& R = Results[bi];
+      SOut << "    {\n"
+           << "      \"binary\": \"" << R.BaseName << "\",\n"
+           << "      \"total_functions\": " << R.TotalFunctions << ",\n"
+           << "      \"text_ec_functions\": " << R.Arm64ECNativeFunctions << ",\n"
+           << "      \"text_fx_non_thunk_functions\": " << (R.FEXSRAFunctions - R.SingleInstThunkFunctions) << ",\n"
+           << "      \"thunk_functions\": " << R.SingleInstThunkFunctions << ",\n"
+           << "      \"functions\": [\n";
+      for (size_t fi = 0; fi < R.Functions.size(); ++fi) {
+        const auto& F = R.Functions[fi];
+        SOut << "        {\n"
+             << "          \"name\": \"" << F.SymbolName << "\",\n"
+             << "          \"entry_va\": " << F.EntryVA << ",\n"
+             << "          \"entry_rva\": " << F.EntryRVA << ",\n"
+             << "          \"guest_inst_count\": " << F.GuestInstCount << ",\n"
+             << "          \"basic_block_count\": " << F.BasicBlockCount << ",\n"
+             << "          \"tier\": \"" << (F.TargetABI == FEXCore::AOT::AOTTargetABI::ARM64EC_NATIVE ? "ARM64EC_NATIVE" : "FEX_SRA") << "\",\n"
+             << "          \"disqualify_mask\": " << F.Safety.DisqualificationMask << ",\n"
+             << "          \"live_in_gpr_mask\": " << F.Safety.LiveInGPRMask << ",\n"
+             << "          \"live_out_gpr_mask\": " << F.Safety.LiveOutGPRMask << ",\n"
+             << "          \"live_in_fpr_mask\": " << F.Safety.LiveInFPRMask << ",\n"
+             << "          \"live_out_fpr_mask\": " << F.Safety.LiveOutFPRMask << ",\n"
+             << "          \"reads_flags_in\": " << (F.Safety.ReadsFlagsIn ? "true" : "false") << ",\n"
+             << "          \"writes_flags_out\": " << (F.Safety.WritesFlagsOut ? "true" : "false") << ",\n"
+             << "          \"has_direct_calls\": " << (F.Safety.HasDirectCalls ? "true" : "false") << ",\n"
+             << "          \"has_indirect_calls\": " << (F.Safety.HasIndirectCalls ? "true" : "false") << ",\n"
+             << "          \"has_returns\": " << (F.Safety.HasReturns ? "true" : "false") << ",\n"
+             << "          \"has_atomic_ops\": " << (F.Safety.HasAtomicOps ? "true" : "false") << ",\n"
+             << "          \"fex_jit_inst_count\": " << (F.FEXJITCodeOnlyBytes / 4) << ",\n"
+             << "          \"llvm_sra_inst_count\": " << (F.LLVMSRACodeOnlyBytes / 4) << ",\n"
+             << "          \"llvm_sra_raw_inst_count\": " << (F.LLVMSRARawBodyBytes / 4) << ",\n"
+             << "          \"llvm_aot_inst_count\": " << (F.LLVMAOTCodeOnlyBytes / 4) << ",\n"
+             << "          \"llvm_aot_raw_inst_count\": " << (F.LLVMRawBodyBytes / 4) << ",\n";
+        auto WriteWordArray = [&](const char* Key, const std::vector<uint32_t>& Words, bool Comma) {
+          SOut << "          \"" << Key << "\": [";
+          for (size_t wi = 0; wi < Words.size(); ++wi) {
+            SOut << Words[wi] << (wi + 1 < Words.size() ? "," : "");
+          }
+          SOut << "]" << (Comma ? "," : "") << "\n";
+        };
+        WriteWordArray("fex_jit_words", F.FEXJITWords, true);
+        WriteWordArray("llvm_sra_words", F.LLVMSRAWords, true);
+        WriteWordArray("llvm_aot_words", F.LLVMAOTWords, false);
+        SOut << "        }" << (fi + 1 < R.Functions.size() ? "," : "") << "\n";
+      }
+      SOut << "      ]\n    }" << (bi + 1 < Results.size() ? "," : "") << "\n";
+    }
+    SOut << "  ]\n}\n";
   }
 
   return 0;

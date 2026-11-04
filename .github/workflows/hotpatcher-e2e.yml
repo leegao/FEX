@@ -1,0 +1,56 @@
+name: Standalone Arm64EC .aot.dll Hotpatcher E2E CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-arm64ec-hotpatcher:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies and llvm-mingw
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 curl tar xz-utils xvfb clang llvm-dev
+          LLVM_MINGW_URL="https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-aarch64.tar.xz"
+          mkdir -p /opt/llvm-mingw
+          curl -sSL "$LLVM_MINGW_URL" | tar -xJ -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> $GITHUB_PATH
+
+      - name: Fetch and unpack DroidDeck-Proton 11-11.9
+        run: |
+          PROTON_URL="https://github.com/Droid-Deck/DroidDeck-Proton/releases/download/DroidDeck-Proton-11-11.9/DroidDeck-Proton-11-11.9-aarch64.tar.gz"
+          mkdir -p /opt/droiddeck-proton
+          curl -sSL "$PROTON_URL" | tar -xz -C /opt/droiddeck-proton --strip-components=1
+
+      - name: Build fex-aot-pe and compile fex_aot_hotpatcher_test.exe + .aot.dll
+        run: |
+          chmod +x ./mk-fex-aot-pe.sh
+          ./mk-fex-aot-pe.sh
+          x86_64-w64-mingw32-clang -O2 samples/fex_aot_hotpatcher_test.c -o samples/fex_aot_hotpatcher_test.exe
+          mkdir -p aot_cache
+          ./build/Bin/fex-aot-pe --output-dir aot_cache --audit samples/fex_aot_hotpatcher_test.exe
+
+      - name: Run Standalone Arm64EC .aot.dll Hotpatcher E2E Test under Wine
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_APP_CACHE_LOCATION: 'C:\fex-cache\'
+          FEX_ENABLECODECACHINGWIP: 1
+        run: |
+          CACHE_DEST="${{ github.workspace }}/wineprefix/drive_c/fex-cache/cache"
+          mkdir -p "$CACHE_DEST"
+          cp -fv aot_cache/*.aot.dll "$CACHE_DEST/"
+          cp -fv aot_cache/*.fxcc "$CACHE_DEST/" 2>/dev/null || true
+          AOT_DLL=$(ls aot_cache/*.aot.dll | head -n 1)
+          OUTPUT=$(xvfb-run -a wine samples/fex_aot_hotpatcher_test.exe "$AOT_DLL" 2>&1)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep "Rollback verified"

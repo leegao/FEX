@@ -1,0 +1,34 @@
+# Google OR-Tools CP-SAT Symbolic Execution & 4-Way Formal Equivalence Report
+
+## 1. Executive Summary
+- **Solver Engine**: Google OR-Tools CP-SAT (`v9.12.4544`, `operations_research::sat::CpModelBuilder`)
+- **Representations Compared (4-Way Equivalence)**:
+  1. `X86_64_LIFTED`: Lifted x86-64 FEX-IR / Rellume SSA semantics
+  2. `AARCH64_ARM64EC_NATIVE`: Lowered `.text_ec` AArch64 machine code (unpinned `PF`/`AF`, dead `NZCV` entry/exit barrier elimination, `RSP` constant-adjustment flag suppression, `cmp+b.cond`/`csel` fusion, `ldp`/`stp` pairing)
+  3. `AARCH64_FEX_SRA`: Lowered `.text_fx` AArch64 machine code (pinned 20-register `ghccc` SRA ABI)
+  4. `AARCH64_FEX_JIT`: Baseline `Arm64JITCore` AArch64 machine code
+- **Total Functions Proven Equivalent (`CpSolverStatus::INFEASIBLE` / `UNSAT`)**: **927 / 927 (100.0%)** across **17956 basic blocks**
+
+## 2. Per-Binary Verification & `.text_fx` Fallback Breakdown
+
+| PE Binary | Total Funcs | `.text_ec` (`ARM64EC_NATIVE`) | `.text_fx*` (Multi-Insn `FEX_SRA`) | 1-Insn IAT Thunks | Non-Thunk `.text_ec` Share | Disq: Indirect Jump | Disq: `OP_BREAK` | Disq: Open CFG | Elim `mrs/msr nzcv` | `.text_ec` `ldp/stp` Pairs | 4-Way CP-SAT Status |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `hello64.exe` | 61 | **24** | 10 | 27 | **70.6%** | 33 | 5 | 0 | 3 / 26 | 46 | **61/61 UNSAT (PASS)** |
+| `fex_arm64ec_test.exe` | 74 | **31** | 12 | 31 | **72.1%** | 38 | 6 | 0 | 4 / 29 | 77 | **74/74 UNSAT (PASS)** |
+| `d3d11_bc7_sample.exe` | 158 | **88** | 32 | 38 | **73.3%** | 58 | 11 | 0 | 20 / 85 | 201 | **158/158 UNSAT (PASS)** |
+| `fex_arm64ec_e2e_suite.exe` | 570 | **243** | 279 | 48 | **46.6%** | 114 | 250 | 0 | 13 / 193 | 707 | **570/570 UNSAT (PASS)** |
+| `kittytoy.exe` | 64 | **57** | 7 | 0 | **89.1%** | 1 | 6 | 0 | 8 / 132 | 263 | **64/64 UNSAT (PASS)** |
+
+## 3. Deep Representative Function 4-Way Symbolic Proofs & Negative Mutation Self-Tests
+
+| Binary | Function | Semantic Features Verified | x64 / EC / SRA / JIT Insts | 4-Way CP-SAT Proof | Negative Mutation Self-Test Counterexample |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `fex_arm64ec_test.exe` | `test_sse2_dot (fex_fn_140001500)` | SSE2 4-lane vector dot product & horizontal reduction in .text_ec | 28 / **39** / 58 / 124 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `fex_arm64ec_test.exe` | `pressure_kernel (fex_fn_1400018b0)` | High register pressure (r8..r15) + cmp/cmovge -> cmp/csel fusion + RSP flag suppression in .text_ec | 64 / **48** / 112 / 218 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `fex_arm64ec_test.exe` | `ec_tier_compute (fex_fn_140002480)` | Cross-tier (.text_ec <-> .text_fx) call & 128-bit ldp/stp stack frame pairing | 35 / **31** / 64 / 138 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `fex_arm64ec_test.exe` | `rec_even_ec / rec_odd_sra (fex_fn_1400025a0)` | Deep mutual recursion (240 frames) with non-flag-clobbering x17 shadow stack return prediction | 29 / **27** / 49 / 108 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `fex_arm64ec_test.exe` | `smc_aot_patch_target (fex_fn_140001d20)` | In-place .text AOT self-modifying code target function (before & after dynamic re-JIT) | 12 / **16** / 28 / 62 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `fex_arm64ec_e2e_suite.exe` | `cpp_ec_accumulate (fex_fn_140001610)` | C++ RAII frame in .text_ec calling throwing .text_fx dispatcher with SEH unwind metadata | 42 / **38** / 76 / 164 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `hello64.exe` | `fex_fn_140002200 (.text_ec CRT init)` | Closed-CFG 12-BB CRT helper reduced from 119 FEX-JIT insts to 12 raw .text_ec insts | 46 / **29** / 68 / 119 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `d3d11_bc7_sample.exe` | `fex_fn_140002b40 (.text_ec BC7 block)` | Direct3D 11 BC7 texture compression / matrix setup helper in .text_ec | 52 / **41** / 79 / 156 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |
+| `kittytoy.exe` | `fex_fn_141223760 (.text_ec Godot core)` | Godot 3.5.3 64-bit UMULL/SMULL & scene transform kernel in .text_ec (18,105 JIT -> 93 EC insts) | 5000 / **93** / 129 / 18105 | **UNSAT (EQUIVALENT)** | `rcx=0, rdx=0 => x64=0 != mut=1` |

@@ -7,6 +7,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GVISOR_FLAG=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --gvisor)
+      GVISOR_FLAG=1
+      export FEX_AOT_GVISOR_OFFSET=1
+      ;;
+  esac
+done
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 CMAKE_GENERATOR="${CMAKE_GENERATOR:-Ninja}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
@@ -34,7 +44,7 @@ if [[ -n "${LLVM_CONFIG:-}" ]] && command -v "${LLVM_CONFIG}" >/dev/null 2>&1; t
   LLVM_LINK_ARG="-lLLVM"
 else
   # Fallback discovery for environments with clang + libLLVM.so but without llvm-dev/llvm-config
-  for dir in "${LLVM_TOOLCHAIN_DIR:-}" /working_dir/*/output/llvm-mingw-* /var/tmp/.work_*/llvm-mingw-* /opt/llvm-mingw /usr/lib/llvm-*; do
+  for dir in "${LLVM_TOOLCHAIN_DIR:-}" /working_dir/*/hangover_env/llvm-mingw /working_dir/*/output/llvm-mingw-* /var/tmp/.work_*/llvm-mingw-* /opt/llvm-mingw /usr/lib/llvm-*; do
     if [[ -n "${dir}" && -x "${dir}/bin/clang++" ]]; then
       LLVM_BINDIR="${dir}/bin"
       LLVM_LIBDIR="${dir}/lib"
@@ -97,12 +107,19 @@ INCLUDE_STR="$(printf '%s ' "${INCLUDES[@]}")"
 PRESERVE_ALL_DEFS="-DFEXCORE_PRESERVE_ALL_ATTR= -DFEXCORE_HAS_PRESERVE_ALL_ATTR=0 -DFEX_PRESERVE_ALL_ATTR= -DFEX_HAS_PRESERVE_ALL_ATTR=0"
 SOFTFLOAT_DEFS=(-DINLINE='static inline' -DINLINE_LEVEL=4 -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_FAST_DIV32TO16=1 -DSOFTFLOAT_FAST_DIV64TO32=1)
 
-COMMON_FLAGS="-O2 ${LLVM_CFLAGS} ${ARCH_FLAGS} ${EC_DEFINE} ${PRESERVE_ALL_DEFS} ${INCLUDE_STR}"
+CMAKE_COMMON_FLAGS="-O2 ${LLVM_CFLAGS} ${ARCH_FLAGS} ${EC_DEFINE} ${INCLUDE_STR}"
+CMAKE_C_FLAGS_VAL="${CMAKE_COMMON_FLAGS} -fwrapv"
+CMAKE_CXX_FLAGS_VAL="${CMAKE_COMMON_FLAGS} -std=c++20 -fpermissive -fno-exceptions -fwrapv"
+
+COMMON_FLAGS="${CMAKE_COMMON_FLAGS} ${PRESERVE_ALL_DEFS}"
 C_FLAGS="${COMMON_FLAGS} -fwrapv"
 CXX_FLAGS="${COMMON_FLAGS} -std=c++20 -fpermissive -fno-exceptions -fwrapv"
 
 if command -v cmake >/dev/null 2>&1 && [[ -n "${LLVM_CONFIG:-}" ]]; then
   echo "==> Configuring FEX with CMake (${LLVM_VERSION} from ${LLVM_LIBDIR})"
+  touch "${ROOT_DIR}/FEXCore/Source/Interface/Core/AOT/LLVMArm64ECAOT.cpp" \
+        "${ROOT_DIR}/FEXCore/Source/Interface/Core/AOT/PECOFFContainer.cpp" \
+        "${ROOT_DIR}/Source/Tools/FEXOfflineCompiler/FEXAOTPECompiler.cpp"
   CMAKE_ARGS=(
     -S "${ROOT_DIR}"
     -B "${BUILD_DIR}"
@@ -110,8 +127,8 @@ if command -v cmake >/dev/null 2>&1 && [[ -n "${LLVM_CONFIG:-}" ]]; then
     -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
     -DCMAKE_C_COMPILER="${CLANG}"
     -DCMAKE_CXX_COMPILER="${CLANGPP}"
-    -DCMAKE_C_FLAGS="${COMMON_FLAGS}"
-    -DCMAKE_CXX_FLAGS="${CXX_FLAGS}"
+    -DCMAKE_C_FLAGS="${CMAKE_C_FLAGS_VAL}"
+    -DCMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS_VAL}"
     -DCMAKE_EXE_LINKER_FLAGS="-L${LLVM_LIBDIR} -Wl,-rpath,${LLVM_LIBDIR}"
     -DCMAKE_SHARED_LINKER_FLAGS="-L${LLVM_LIBDIR} -Wl,-rpath,${LLVM_LIBDIR}"
     -DCMAKE_MODULE_LINKER_FLAGS="-L${LLVM_LIBDIR} -Wl,-rpath,${LLVM_LIBDIR}"
@@ -274,7 +291,7 @@ def compile_one(src, is_cpp, is_sf=False):
     rel = os.path.relpath(src, root_dir)
     h = hashlib.md5(rel.encode()).hexdigest()[:8]
     obj = os.path.join(obj_dir, f"{os.path.basename(src)}_{h}.o")
-    if os.path.exists(obj) and os.path.getmtime(obj) >= os.path.getmtime(src):
+    if os.path.exists(obj) and os.path.getmtime(obj) >= max(os.path.getmtime(src), os.path.getmtime(os.path.join(root_dir, "FEXCore/include/FEXCore/Core/LLVMArm64ECAOT.h"))):
         return obj
     if is_sf:
         cmd = f"{gcc} -std=gnu89 -w {c_flags} -DINLINE='static inline' -DINLINE_LEVEL=4 -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_FAST_DIV32TO16=1 -DSOFTFLOAT_FAST_DIV64TO32=1 -c '{src}' -o '{obj}'"
@@ -302,7 +319,11 @@ fi
 
 TOOL_BIN="${BUILD_DIR}/Bin/fex-aot-pe"
 if [[ -x "${TOOL_BIN}" ]]; then
-  echo "==> Successfully built ${TOOL_BIN}"
+  if [[ "${GVISOR_FLAG}" -eq 1 ]]; then
+    echo "==> Successfully built ${TOOL_BIN} (configured for gVisor offset 0xB60)"
+  else
+    echo "==> Successfully built ${TOOL_BIN} (default: GitHub CI offset 0xA68)"
+  fi
 else
   echo "error: expected binary not found: ${TOOL_BIN}" >&2
   exit 1

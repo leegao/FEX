@@ -314,42 +314,58 @@ bool BuildDualPECOFFAndFXCCContainer(
     const std::vector<CompiledAOTBlock>& Blocks,
     const std::vector<Arm64ECThunkRecord>& Thunks,
     std::vector<uint8_t>& OutDualPECOFF,
-    std::vector<uint8_t>& OutRawFXCC) {
+    std::vector<uint8_t>& OutRawFXCC,
+    uint64_t* OutTextEcSize,
+    uint64_t* OutTextFexSize,
+    uint64_t* OutDeoptCount) {
   OutDualPECOFF.clear();
   OutRawFXCC.clear();
   if (Blocks.empty()) {
     return false;
   }
 
-  // Sort blocks deterministically by GuestEntryRVA
-  std::vector<const CompiledAOTBlock*> SortedBlocks;
-  SortedBlocks.reserve(Blocks.size());
+  // Partition blocks into Tier 2 (.text_ec, ARM64EC_NATIVE) and Tier 1 (.text_fex, FEX_SRA)
+  std::vector<const CompiledAOTBlock*> EcBlocks;
+  std::vector<const CompiledAOTBlock*> FexBlocks;
+  EcBlocks.reserve(Blocks.size());
+  FexBlocks.reserve(Blocks.size());
   for (const auto& B : Blocks) {
-    SortedBlocks.push_back(&B);
+    if (B.TargetABI == AOTTargetABI::ARM64EC_NATIVE) {
+      EcBlocks.push_back(&B);
+    } else {
+      FexBlocks.push_back(&B);
+    }
   }
-  std::sort(SortedBlocks.begin(), SortedBlocks.end(),
-            [](const CompiledAOTBlock* A, const CompiledAOTBlock* B) { return A->GuestEntryVA < B->GuestEntryVA; });
+  auto SortByVA = [](const CompiledAOTBlock* A, const CompiledAOTBlock* B) {
+    return A->GuestEntryVA < B->GuestEntryVA;
+  };
+  std::sort(EcBlocks.begin(), EcBlocks.end(), SortByVA);
+  std::sort(FexBlocks.begin(), FexBlocks.end(), SortByVA);
 
-  // Assemble the page-aligned CodeBuffer (.text section) and combined Relocations + CodePages map
+  // Assemble the page-aligned CodeBuffer partitioned into [.text_ec | .text_fex]
+  // Because .text_ec and .text_fex are placed immediately adjacent and page-aligned,
+  // FEX's CodeCache::LoadCache maps the entire combined CodeBuffer in a single zero-copy span
+  // while PE/COFF tools see two distinct executable sections (.text_ec and .text_fex)!
   std::vector<uint8_t> CodeBuffer;
   std::vector<FEXCore::CPU::Relocation> AllRelocations;
   std::map<uint64_t, std::vector<uint64_t>> PageIndexToEntrypoints;
 
   struct BlockPlacement {
     const CompiledAOTBlock* Block;
-    uint32_t BlockBeginOffset;
-    uint32_t EntryPointOffset;
+    uint32_t BlockBeginOffset; // Offset from start of combined CodeBuffer
+    uint32_t EntryPointOffset; // Offset from start of combined CodeBuffer
+    bool IsEcPartition;
   };
   std::vector<BlockPlacement> Placements;
-  Placements.reserve(SortedBlocks.size());
+  Placements.reserve(Blocks.size());
 
-  for (const CompiledAOTBlock* B : SortedBlocks) {
+  auto PlaceBlockInBuffer = [&](const CompiledAOTBlock* B, bool IsEc) {
     while (CodeBuffer.size() % 16 != 0) {
       CodeBuffer.push_back(0);
     }
     uint32_t BaseOff = static_cast<uint32_t>(CodeBuffer.size());
     uint32_t EntryOff = BaseOff + (B->EntryPoints.empty() ? 4u : B->EntryPoints[0].second);
-    Placements.push_back({B, BaseOff, EntryOff});
+    Placements.push_back({B, BaseOff, EntryOff, IsEc});
 
     CodeBuffer.insert(CodeBuffer.end(), B->BlockBytes.begin(), B->BlockBytes.end());
 
@@ -361,7 +377,47 @@ bool BuildDualPECOFFAndFXCCContainer(
       uint64_t PageIdx = PageVA >> 12;
       PageIndexToEntrypoints[PageIdx].push_back(B->GuestEntryVA);
     }
+  };
+
+  // 1a. Emit .text_ec partition (ARM64EC_NATIVE functions)
+  for (const CompiledAOTBlock* B : EcBlocks) {
+    PlaceBlockInBuffer(B, true);
   }
+  if (CodeBuffer.empty()) {
+    // Emit a minimal 16-byte Arm64EC fast-return stub if all functions were forced into FEX_SRA
+    uint32_t Stub[4] = {0xD503201Fu, 0xD65F03C0u, 0x00000000u, 0x00000000u};
+    const auto* Ptr = reinterpret_cast<const uint8_t*>(Stub);
+    CodeBuffer.insert(CodeBuffer.end(), Ptr, Ptr + sizeof(Stub));
+  }
+  uint32_t TextEcRawSize = static_cast<uint32_t>(CodeBuffer.size());
+  uint32_t TextEcAlignedSize = AlignUpU32(std::max<uint32_t>(TextEcRawSize, 16u), PE_PAGE_SIZE);
+  CodeBuffer.resize(TextEcAlignedSize, 0);
+
+  // 1b. Emit .text_fex partition (FEX_SRA blocks) immediately starting at offset TextEcAlignedSize
+  for (const CompiledAOTBlock* B : FexBlocks) {
+    PlaceBlockInBuffer(B, false);
+  }
+  if (CodeBuffer.size() == TextEcAlignedSize) {
+    // Emit a minimal 16-byte FEX-SRA dispatcher jump stub at the start of .text_fex
+    // str x16, [x28, #0x18] ; ldr x11, [x28, #0xB60] ; br x11 ; udf #0
+    uint32_t SraStub[4] = {0xF9000F90u, 0xF945B38Bu, 0xD61F0160u, 0x00000000u};
+    const auto* Ptr = reinterpret_cast<const uint8_t*>(SraStub);
+    CodeBuffer.insert(CodeBuffer.end(), Ptr, Ptr + sizeof(SraStub));
+  }
+  uint32_t TextFexRawSize = static_cast<uint32_t>(CodeBuffer.size()) - TextEcAlignedSize;
+  uint32_t TextFexAlignedSize = AlignUpU32(std::max<uint32_t>(TextFexRawSize, 16u), PE_PAGE_SIZE);
+  uint32_t CodeBufferAlignedSize = TextEcAlignedSize + TextFexAlignedSize;
+  CodeBuffer.resize(CodeBufferAlignedSize, 0);
+
+  if (OutTextEcSize) *OutTextEcSize = TextEcAlignedSize;
+  if (OutTextFexSize) *OutTextFexSize = TextFexAlignedSize;
+
+  // Sort Placements by GuestEntryVA for deterministic FXCC BlockList & CHPE RedirectionMetadata
+  std::vector<BlockPlacement> SortedPlacements = Placements;
+  std::sort(SortedPlacements.begin(), SortedPlacements.end(),
+            [](const BlockPlacement& A, const BlockPlacement& B) {
+              return A.Block->GuestEntryVA < B.Block->GuestEntryVA;
+            });
 
   // Sort relocations by Offset as required by CodeCache::LoadCache binary search (line 732)
   std::sort(AllRelocations.begin(), AllRelocations.end(),
@@ -369,16 +425,12 @@ bool BuildDualPECOFFAndFXCCContainer(
               return A.Header.Offset < B.Header.Offset;
             });
 
-  // Pad CodeBuffer to 4KB page boundary
-  uint32_t CodeBufferAlignedSize = AlignUpU32(static_cast<uint32_t>(CodeBuffer.size()), PE_PAGE_SIZE);
-  CodeBuffer.resize(CodeBufferAlignedSize, 0);
-
   PrepareCodeBufferForStorage(BaseManifest.SourceImageBase, CodeBuffer, AllRelocations);
 
   // Build FXCC Header + BlockList + Relocations (.fxmeta section)
   RawCodeCacheHeader FxHdr {};
   std::copy(GIT_HASH.begin(), GIT_HASH.end(), FxHdr.FEXVersion);
-  FxHdr.NumBlocks = static_cast<uint32_t>(Placements.size());
+  FxHdr.NumBlocks = static_cast<uint32_t>(SortedPlacements.size());
   FxHdr.NumCodePages = static_cast<uint32_t>(PageIndexToEntrypoints.size());
   FxHdr.CodeBufferSize = CodeBufferAlignedSize;
   FxHdr.NumRelocations = static_cast<uint32_t>(AllRelocations.size());
@@ -393,7 +445,7 @@ bool BuildDualPECOFFAndFXCCContainer(
 
   AppendBytes(FxMeta, &FxHdr, sizeof(FxHdr));
 
-  for (const auto& P : Placements) {
+  for (const auto& P : SortedPlacements) {
     uint64_t GuestRel = P.Block->GuestEntryVA - BaseManifest.SourceImageBase;
     uint64_t HostOff = P.EntryPointOffset;
     uint64_t NumPages = P.Block->GuestCodePages.size();
@@ -428,7 +480,7 @@ bool BuildDualPECOFFAndFXCCContainer(
   uint32_t FxPagesUnalignedSize = static_cast<uint32_t>(FxPages.size());
   uint32_t FxPagesAlignedSize = AlignUpU32(std::max<uint32_t>(FxPagesUnalignedSize, 16u), PE_PAGE_SIZE);
 
-  // 1. Construct OutRawFXCC (exact raw FXCC v2 stream: FxMeta + CodeBuffer + unpadded FxPages)
+  // 1. Construct OutRawFXCC (exact raw FXCC v2 stream: FxMeta + CodeBuffer [.text_ec | .text_fex] + unpadded FxPages)
   OutRawFXCC.reserve(FxMeta.size() + CodeBuffer.size() + FxPagesUnalignedSize);
   OutRawFXCC.insert(OutRawFXCC.end(), FxMeta.begin(), FxMeta.end());
   OutRawFXCC.insert(OutRawFXCC.end(), CodeBuffer.begin(), CodeBuffer.end());
@@ -437,7 +489,7 @@ bool BuildDualPECOFFAndFXCCContainer(
   // Pad FxPages to page boundary for PE section alignment
   FxPages.resize(FxPagesAlignedSize, 0);
 
-  // 2. Build .wowthk section containing LLVM-generated Arm64EC entry/exit thunks
+  // 2. Build .wowthk section containing LLVM-generated Arm64EC entry/exit thunks & hybrid dispatch adaptors
   std::vector<uint8_t> WowThk;
   struct ThunkPlacement {
     std::string Name;
@@ -452,7 +504,6 @@ bool BuildDualPECOFFAndFXCCContainer(
     ThunkPlacements.push_back({T.Name, Off, static_cast<uint32_t>(T.Bytes.size())});
   }
   if (WowThk.empty()) {
-    // Emit a default Arm64EC fast-return stub if no external thunks were passed
     uint32_t RetInsn = 0xD65F03C0u;
     AppendBytes(WowThk, &RetInsn, 4);
     ThunkPlacements.push_back({"$ientry_thunk$cdecl$v$v", 0, 4});
@@ -463,48 +514,76 @@ bool BuildDualPECOFFAndFXCCContainer(
 
   // Compute section RVAs (identical to FileOffsets because SectionAlignment == FileAlignment == 0x1000!)
   const uint32_t SecFxMetaRVA  = PE_PAGE_SIZE; // 0x1000
-  const uint32_t SecTextRVA    = SecFxMetaRVA + FxMetaAlignedSize;
-  const uint32_t SecFxPageRVA  = SecTextRVA + CodeBufferAlignedSize;
+  const uint32_t SecTextEcRVA  = SecFxMetaRVA + FxMetaAlignedSize;
+  const uint32_t SecTextFexRVA = SecTextEcRVA + TextEcAlignedSize;
+  const uint32_t SecFxPageRVA  = SecTextFexRVA + TextFexAlignedSize;
   const uint32_t SecWowThkRVA  = SecFxPageRVA + FxPagesAlignedSize;
 
-  // 3. Build .pdata section (PERuntimeFunction entries for every compiled function + unwind info)
-  std::vector<uint8_t> PData;
-  const uint32_t NumRuntimeFns = static_cast<uint32_t>(Placements.size() + ThunkPlacements.size());
-  const uint32_t UnwindDataOffsetInPData = NumRuntimeFns * sizeof(PERuntimeFunction);
+  // 3. Build .pdata section (PERuntimeFunction entries sorted by BeginAddress + per-block .xdata UNWIND_INFO)
+  struct PDataCandidate {
+    uint32_t BeginRVA;
+    uint32_t EndRVA;
+    uint16_t StackAdjustBytes;
+  };
+  std::vector<PDataCandidate> PDataCandidates;
+  PDataCandidates.reserve(Placements.size() + ThunkPlacements.size());
   for (const auto& P : Placements) {
-    PERuntimeFunction RF {};
-    RF.BeginAddress = SecTextRVA + P.EntryPointOffset;
-    RF.EndAddress = SecTextRVA + P.BlockBeginOffset + P.Block->CodeOnlyBytes + 4;
-    RF.UnwindInfoAddress = 0; // Patched once SecPDataRVA is known
-    AppendBytes(PData, &RF, sizeof(RF));
+    uint32_t BeginRVA = SecTextEcRVA + P.EntryPointOffset;
+    uint32_t EndRVA = SecTextEcRVA + P.BlockBeginOffset + P.Block->CodeOnlyBytes + 4;
+    PDataCandidates.push_back({BeginRVA, EndRVA, P.Block->HostStackAdjustBytes});
   }
   for (const auto& TP : ThunkPlacements) {
-    PERuntimeFunction RF {};
-    RF.BeginAddress = SecWowThkRVA + TP.OffsetInSection;
-    RF.EndAddress = SecWowThkRVA + TP.OffsetInSection + TP.Size;
-    RF.UnwindInfoAddress = 0;
-    AppendBytes(PData, &RF, sizeof(RF));
+    uint32_t BeginRVA = SecWowThkRVA + TP.OffsetInSection;
+    uint32_t EndRVA = BeginRVA + TP.Size;
+    PDataCandidates.push_back({BeginRVA, EndRVA, 0});
   }
-  // Minimal 8-byte unwind info record at UnwindDataOffsetInPData
-  uint8_t UnwindRecord[8] = {0x01, 0x00, 0x00, 0x00, 0xE4, 0x00, 0x00, 0x00};
-  AppendBytes(PData, UnwindRecord, sizeof(UnwindRecord));
+  std::sort(PDataCandidates.begin(), PDataCandidates.end(),
+            [](const PDataCandidate& A, const PDataCandidate& B) { return A.BeginRVA < B.BeginRVA; });
+
+  std::vector<uint8_t> PData;
+  const uint32_t NumRuntimeFns = static_cast<uint32_t>(PDataCandidates.size());
+  const uint32_t UnwindDataOffsetInPData = NumRuntimeFns * sizeof(PERuntimeFunction);
+  PData.resize(UnwindDataOffsetInPData, 0);
+
+  std::vector<uint32_t> UnwindRecordOffsets(NumRuntimeFns, 0);
+  for (uint32_t i = 0; i < NumRuntimeFns; ++i) {
+    while (PData.size() % 4 != 0) PData.push_back(0);
+    UnwindRecordOffsets[i] = static_cast<uint32_t>(PData.size());
+    const auto& C = PDataCandidates[i];
+    uint32_t FuncWords = std::min<uint32_t>((C.EndRVA > C.BeginRVA ? (C.EndRVA - C.BeginRVA) / 4 : 1u), 0x3FFFFu);
+    uint8_t CodeWords = 1;
+    // Windows ARM64 XDATA header: [17:0]=FunctionLength(words), [20:18]=Version(0), [21]=X(0), [22]=E(0), [26:23]=EpilogCount(0), [31:27]=CodeWords(1)
+    uint32_t XHdr = (FuncWords & 0x3FFFFu) | (static_cast<uint32_t>(CodeWords) << 27);
+    AppendBytes(PData, &XHdr, 4);
+    uint8_t UnwindCodes[4] = {0xE4, 0xE4, 0xE4, 0xE4}; // Default: end (0xE4)
+    if (C.StackAdjustBytes > 0 && (C.StackAdjustBytes % 16 == 0) && (C.StackAdjustBytes / 16) < 32) {
+      // ARM64 unwind code `alloc_s`: 000xxxxx (allocates x * 16 bytes on sp), followed by `end` (0xE4)
+      UnwindCodes[0] = static_cast<uint8_t>((C.StackAdjustBytes / 16) & 0x1Fu);
+      UnwindCodes[1] = 0xE4;
+    }
+    AppendBytes(PData, UnwindCodes, 4);
+  }
+
   uint32_t PDataRawSize = static_cast<uint32_t>(PData.size());
   uint32_t PDataAlignedSize = AlignUpU32(PDataRawSize, PE_PAGE_SIZE);
   PData.resize(PDataAlignedSize, 0);
 
   const uint32_t SecPDataRVA = SecWowThkRVA + WowThkAlignedSize;
-  // Patch UnwindInfoAddress RVA in PData
   for (uint32_t i = 0; i < NumRuntimeFns; ++i) {
-    auto* RF = reinterpret_cast<PERuntimeFunction*>(PData.data() + i * sizeof(PERuntimeFunction));
-    RF->UnwindInfoAddress = SecPDataRVA + UnwindDataOffsetInPData;
+    PERuntimeFunction RF {};
+    RF.BeginAddress = PDataCandidates[i].BeginRVA;
+    RF.EndAddress = PDataCandidates[i].EndRVA;
+    RF.UnwindInfoAddress = SecPDataRVA + UnwindRecordOffsets[i];
+    memcpy(PData.data() + i * sizeof(PERuntimeFunction), &RF, sizeof(RF));
   }
 
   // 4. Build .rdata section containing:
   //    - PELoadConfiguration64 (at offset 0 of .rdata)
   //    - PEChpeMetadata (Arm64EC CHPEv2 metadata)
-  //    - PEChpeRangeEntry array (marking .text and .wowthk as CHPE_RANGE_TYPE_ARM64EC)
-  //    - PEChpeRedirectionEntry array (mapping GuestEntryRVA -> Arm64EC RVA in .text)
+  //    - PEChpeRangeEntry array (marking .text_ec, .text_fex, and .wowthk as CHPE_RANGE_TYPE_ARM64EC)
+  //    - PEChpeRedirectionEntry array (mapping GuestEntryRVA -> Arm64EC RVA in .text_ec / .text_fex)
   //    - FEXAOTPEManifest
+  //    - FEXAOTDeoptHeader + FEXAOTDeoptEntry[] (.fxdeopt fault & SEH recovery table)
   //    - PE Export Directory (.edata) exporting all compiled functions and Arm64EC thunks
   const uint32_t SecRDataRVA = SecPDataRVA + PDataAlignedSize;
   std::vector<uint8_t> RData;
@@ -527,28 +606,42 @@ bool BuildDualPECOFFAndFXCCContainer(
   LoadCfg.CHPEMetadataPointer = 0x180000000ULL + SecRDataRVA + ChpeMetaOff;
   RData.resize(ChpeMetaOff + sizeof(ChpeMeta), 0);
 
-  // Emit chpe_range_entry table (2 entries: .text as Arm64EC, .wowthk as Arm64EC)
+  // Emit chpe_range_entry table (3 entries: .text_ec, .text_fex, .wowthk)
   const uint32_t ChpeCodeMapOff = static_cast<uint32_t>(RData.size());
-  PEChpeRangeEntry RangeEntries[2] {};
-  RangeEntries[0].StartOffset = SecTextRVA | CHPE_RANGE_TYPE_ARM64EC;
-  RangeEntries[0].Length = CodeBufferAlignedSize;
-  RangeEntries[1].StartOffset = SecWowThkRVA | CHPE_RANGE_TYPE_ARM64EC;
-  RangeEntries[1].Length = WowThkAlignedSize;
+  PEChpeRangeEntry RangeEntries[3] {};
+  RangeEntries[0].StartOffset = SecTextEcRVA | CHPE_RANGE_TYPE_ARM64EC;
+  RangeEntries[0].Length = TextEcAlignedSize;
+  RangeEntries[1].StartOffset = SecTextFexRVA | CHPE_RANGE_TYPE_ARM64EC;
+  RangeEntries[1].Length = TextFexAlignedSize;
+  RangeEntries[2].StartOffset = SecWowThkRVA | CHPE_RANGE_TYPE_ARM64EC;
+  RangeEntries[2].Length = WowThkAlignedSize;
   AppendBytes(RData, RangeEntries, sizeof(RangeEntries));
 
-  // Emit chpe_redirection_entry table (mapping each guest RVA -> Arm64EC .text RVA)
+  // Emit chpe_redirection_entry table (mapping each guest RVA -> Arm64EC RVA in .text_ec or .text_fex)
   const uint32_t ChpeRedirOff = static_cast<uint32_t>(RData.size());
-  for (const auto& P : Placements) {
+  for (const auto& P : SortedPlacements) {
     PEChpeRedirectionEntry Redir {};
     Redir.Source = P.Block->GuestEntryRVA;
-    Redir.Destination = SecTextRVA + P.EntryPointOffset;
+    Redir.Destination = SecTextEcRVA + P.EntryPointOffset;
     AppendBytes(RData, &Redir, sizeof(Redir));
   }
 
   ChpeMeta.CodeMap = SecRDataRVA + ChpeCodeMapOff;
-  ChpeMeta.CodeMapCount = 2;
+  ChpeMeta.CodeMapCount = 3;
   ChpeMeta.RedirectionMetadata = SecRDataRVA + ChpeRedirOff;
-  ChpeMeta.RedirectionMetadataCount = static_cast<uint32_t>(Placements.size());
+  ChpeMeta.RedirectionMetadataCount = static_cast<uint32_t>(SortedPlacements.size());
+
+  // Wire CHPE dispatch function pointers to our .wowthk hybrid thunks if present
+  for (const auto& TP : ThunkPlacements) {
+    if (TP.Name == "__os_arm64x_check_icall_cfg") {
+      ChpeMeta.__os_arm64x_dispatch_icall_cfg = SecWowThkRVA + TP.OffsetInSection;
+      ChpeMeta.__os_arm64x_dispatch_icall = SecWowThkRVA + TP.OffsetInSection;
+    } else if (TP.Name == "__fex_ec_to_sra_adapter") {
+      ChpeMeta.__os_arm64x_dispatch_call = SecWowThkRVA + TP.OffsetInSection;
+    } else if (TP.Name == "__fex_sra_to_ec_adapter") {
+      ChpeMeta.__os_arm64x_dispatch_ret = SecWowThkRVA + TP.OffsetInSection;
+    }
+  }
 
   memcpy(RData.data() + LoadCfgOff, &LoadCfg, sizeof(LoadCfg));
   memcpy(RData.data() + ChpeMetaOff, &ChpeMeta, sizeof(ChpeMeta));
@@ -558,9 +651,46 @@ bool BuildDualPECOFFAndFXCCContainer(
   // Embed FEXAOTPEManifest in .rdata as well as DOS stub
   FEXAOTPEManifest FinalManifest = BaseManifest;
   FinalManifest.FxccStreamFileOffset = SecFxMetaRVA;
-  FinalManifest.FxccTextFileOffset = SecTextRVA;
+  FinalManifest.FxccTextFileOffset = SecTextEcRVA;
   FinalManifest.FxccPageFileOffset = SecFxPageRVA;
   AppendBytes(RData, &FinalManifest, sizeof(FinalManifest));
+
+  while (RData.size() % 16 != 0) RData.push_back(0);
+
+  // Embed .fxdeopt Fault & SEH Recovery Table (FEXAOTDeoptHeader + sorted FEXAOTDeoptEntry[])
+  std::vector<FEXAOTDeoptEntry> DeoptEntries;
+  DeoptEntries.reserve(Placements.size());
+  for (const auto& P : Placements) {
+    FEXAOTDeoptEntry DE {};
+    DE.HostStartRVA = SecTextEcRVA + P.EntryPointOffset;
+    DE.HostEndRVA = SecTextEcRVA + P.BlockBeginOffset + P.Block->CodeOnlyBytes + 4;
+    DE.GuestEntryRVA = P.Block->GuestEntryRVA;
+    DE.GuestByteOffset = 0;
+    DE.TargetABI = static_cast<uint8_t>(P.Block->TargetABI);
+    DE.Flags = (P.Block->Safety.HasAtomicOps ? 1u : 0u) |
+               ((P.Block->Safety.HasDirectCalls || P.Block->Safety.HasIndirectCalls) ? 2u : 0u) |
+               4u; // Bit 2: HasSEHUnwind
+    DE.LiveOutGPRMask = P.Block->Safety.LiveOutGPRMask;
+    DE.LiveOutFPRMask = P.Block->Safety.LiveOutFPRMask;
+    DE.StackAdjustBytes = P.Block->HostStackAdjustBytes;
+    DeoptEntries.push_back(DE);
+  }
+  std::sort(DeoptEntries.begin(), DeoptEntries.end(),
+            [](const FEXAOTDeoptEntry& A, const FEXAOTDeoptEntry& B) {
+              return A.HostStartRVA < B.HostStartRVA;
+            });
+
+  FEXAOTDeoptHeader DeoptHdr {};
+  DeoptHdr.NumEntries = static_cast<uint32_t>(DeoptEntries.size());
+  DeoptHdr.TextEcRVA = SecTextEcRVA;
+  DeoptHdr.TextEcSize = TextEcAlignedSize;
+  DeoptHdr.TextFexRVA = SecTextFexRVA;
+  DeoptHdr.TextFexSize = TextFexAlignedSize;
+  AppendBytes(RData, &DeoptHdr, sizeof(DeoptHdr));
+  if (!DeoptEntries.empty()) {
+    AppendBytes(RData, DeoptEntries.data(), DeoptEntries.size() * sizeof(FEXAOTDeoptEntry));
+  }
+  if (OutDeoptCount) *OutDeoptCount = DeoptEntries.size();
 
   while (RData.size() % 16 != 0) RData.push_back(0);
 
@@ -570,9 +700,9 @@ bool BuildDualPECOFFAndFXCCContainer(
     uint32_t TargetRVA;
   };
   std::vector<ExportItem> Exports;
-  for (const auto& P : Placements) {
-    Exports.push_back({"#" + P.Block->SymbolName, SecTextRVA + P.EntryPointOffset});
-    Exports.push_back({P.Block->SymbolName, SecTextRVA + P.EntryPointOffset});
+  for (const auto& P : SortedPlacements) {
+    Exports.push_back({"#" + P.Block->SymbolName, SecTextEcRVA + P.EntryPointOffset});
+    Exports.push_back({P.Block->SymbolName, SecTextEcRVA + P.EntryPointOffset});
   }
   for (const auto& TP : ThunkPlacements) {
     Exports.push_back({TP.Name, SecWowThkRVA + TP.OffsetInSection});
@@ -640,6 +770,15 @@ bool BuildDualPECOFFAndFXCCContainer(
   const uint32_t TotalImageSize = SecRelocRVA + RelocAlignedSize;
 
   // 6. Build COFF Symbol Table and String Table (placed at end of file after .reloc)
+  // Section numbers (1-based):
+  //   1: .fxmeta
+  //   2: .text_ec  (ARM64EC_NATIVE)
+  //   3: .text_fex (FEX_SRA)
+  //   4: .fxpage
+  //   5: .wowthk
+  //   6: .pdata
+  //   7: .rdata
+  //   8: .reloc
   std::vector<COFFSymbol18> SymTab;
   std::vector<char> StrTab(4, 0); // First 4 bytes of COFF string table hold total byte size
 
@@ -661,19 +800,21 @@ bool BuildDualPECOFFAndFXCCContainer(
     SymTab.push_back(Sym);
   };
 
-  for (const auto& P : Placements) {
-    AddCOFFSymbol("#" + P.Block->SymbolName, P.EntryPointOffset, 2 /* .text */, 0x20 /* DTYPE_FUNCTION */, 2 /* IMAGE_SYM_CLASS_EXTERNAL */);
-    AddCOFFSymbol(P.Block->SymbolName, P.EntryPointOffset, 2 /* .text */, 0x20, 2);
+  for (const auto& P : SortedPlacements) {
+    int16_t SecNum = P.IsEcPartition ? 2 /* .text_ec */ : 3 /* .text_fex */;
+    uint32_t SecRelVal = P.IsEcPartition ? P.EntryPointOffset : (P.EntryPointOffset - TextEcAlignedSize);
+    AddCOFFSymbol("#" + P.Block->SymbolName, SecRelVal, SecNum, 0x20 /* DTYPE_FUNCTION */, 2 /* IMAGE_SYM_CLASS_EXTERNAL */);
+    AddCOFFSymbol(P.Block->SymbolName, SecRelVal, SecNum, 0x20, 2);
   }
   for (const auto& TP : ThunkPlacements) {
-    AddCOFFSymbol(TP.Name, TP.OffsetInSection, 4 /* .wowthk */, 0x20, 2);
+    AddCOFFSymbol(TP.Name, TP.OffsetInSection, 5 /* .wowthk */, 0x20, 2);
   }
   uint32_t StrTabTotalSize = static_cast<uint32_t>(StrTab.size());
   memcpy(StrTab.data(), &StrTabTotalSize, 4);
 
   const uint32_t SymTabFileOffset = TotalImageSize;
 
-  // 7. Assemble Page 0 (0x0000 .. 0x0FFF): DOS Header + FEXAOTPEManifest + NT Headers + 7 Section Headers
+  // 7. Assemble Page 0 (0x0000 .. 0x0FFF): DOS Header + FEXAOTPEManifest + NT Headers + 8 Section Headers
   std::vector<uint8_t> HeaderPage(PE_PAGE_SIZE, 0);
   PEDosHeader DosHdr {};
   memcpy(HeaderPage.data(), &DosHdr, sizeof(DosHdr));
@@ -681,7 +822,7 @@ bool BuildDualPECOFFAndFXCCContainer(
 
   PENtHeaders64 NtHdr {};
   NtHdr.FileHeader.Machine = 0x8664; // AMD64 + CHPEMetadata => Arm64EC (0xA641)
-  NtHdr.FileHeader.NumberOfSections = 7;
+  NtHdr.FileHeader.NumberOfSections = 8;
   NtHdr.FileHeader.TimeDateStamp = BaseManifest.SourceTimeDateStamp;
   NtHdr.FileHeader.PointerToSymbolTable = SymTabFileOffset;
   NtHdr.FileHeader.NumberOfSymbols = static_cast<uint32_t>(SymTab.size());
@@ -690,8 +831,8 @@ bool BuildDualPECOFFAndFXCCContainer(
 
   NtHdr.OptionalHeader.SizeOfCode = CodeBufferAlignedSize + WowThkAlignedSize;
   NtHdr.OptionalHeader.SizeOfInitializedData = FxMetaAlignedSize + FxPagesAlignedSize + PDataAlignedSize + RDataAlignedSize + RelocAlignedSize;
-  NtHdr.OptionalHeader.AddressOfEntryPoint = SecTextRVA + Placements[0].EntryPointOffset;
-  NtHdr.OptionalHeader.BaseOfCode = SecTextRVA;
+  NtHdr.OptionalHeader.AddressOfEntryPoint = SecTextEcRVA + SortedPlacements[0].EntryPointOffset;
+  NtHdr.OptionalHeader.BaseOfCode = SecTextEcRVA;
   NtHdr.OptionalHeader.ImageBase = 0x180000000ULL;
   NtHdr.OptionalHeader.SizeOfImage = TotalImageSize;
   NtHdr.OptionalHeader.SizeOfHeaders = PE_PAGE_SIZE;
@@ -708,7 +849,7 @@ bool BuildDualPECOFFAndFXCCContainer(
 
   memcpy(HeaderPage.data() + DosHdr.e_lfanew, &NtHdr, sizeof(NtHdr));
 
-  PESectionHeader SecHdrs7[7] {};
+  PESectionHeader SecHdrs8[8] {};
   auto SetSec = [](PESectionHeader& S, const char* Name, uint32_t VSize, uint32_t RVA, uint32_t RawSize, uint32_t Flags) {
     memset(S.Name, 0, 8);
     strncpy(S.Name, Name, 8);
@@ -723,15 +864,16 @@ bool BuildDualPECOFFAndFXCCContainer(
   constexpr uint32_t SCN_EXEC_CODE = 0x60000020u; // CNT_CODE | MEM_EXECUTE | MEM_READ
   constexpr uint32_t SCN_RELOC     = 0x42000040u; // INITIALIZED_DATA | MEM_DISCARDABLE | MEM_READ
 
-  SetSec(SecHdrs7[0], ".fxmeta", FxMetaAlignedSize, SecFxMetaRVA, FxMetaAlignedSize, SCN_READ_DATA);
-  SetSec(SecHdrs7[1], ".text",   CodeBufferAlignedSize, SecTextRVA, CodeBufferAlignedSize, SCN_EXEC_CODE);
-  SetSec(SecHdrs7[2], ".fxpage", FxPagesAlignedSize, SecFxPageRVA, FxPagesAlignedSize, SCN_READ_DATA);
-  SetSec(SecHdrs7[3], ".wowthk", WowThkRawSize, SecWowThkRVA, WowThkAlignedSize, SCN_EXEC_CODE);
-  SetSec(SecHdrs7[4], ".pdata",  PDataRawSize, SecPDataRVA, PDataAlignedSize, SCN_READ_DATA);
-  SetSec(SecHdrs7[5], ".rdata",  RDataRawSize, SecRDataRVA, RDataAlignedSize, SCN_READ_DATA);
-  SetSec(SecHdrs7[6], ".reloc",  RelocRawSize, SecRelocRVA, RelocAlignedSize, SCN_RELOC);
+  SetSec(SecHdrs8[0], ".fxmeta",   FxMetaAlignedSize,  SecFxMetaRVA,  FxMetaAlignedSize,  SCN_READ_DATA);
+  SetSec(SecHdrs8[1], ".text_ec",  TextEcAlignedSize,  SecTextEcRVA,  TextEcAlignedSize,  SCN_EXEC_CODE);
+  SetSec(SecHdrs8[2], ".text_fx",  TextFexAlignedSize, SecTextFexRVA, TextFexAlignedSize, SCN_EXEC_CODE);
+  SetSec(SecHdrs8[3], ".fxpage",   FxPagesAlignedSize, SecFxPageRVA,  FxPagesAlignedSize, SCN_READ_DATA);
+  SetSec(SecHdrs8[4], ".wowthk",   WowThkRawSize,      SecWowThkRVA,  WowThkAlignedSize,  SCN_EXEC_CODE);
+  SetSec(SecHdrs8[5], ".pdata",    PDataRawSize,       SecPDataRVA,   PDataAlignedSize,   SCN_READ_DATA);
+  SetSec(SecHdrs8[6], ".rdata",    RDataRawSize,       SecRDataRVA,   RDataAlignedSize,   SCN_READ_DATA);
+  SetSec(SecHdrs8[7], ".reloc",    RelocRawSize,       SecRelocRVA,   RelocAlignedSize,   SCN_RELOC);
 
-  memcpy(HeaderPage.data() + DosHdr.e_lfanew + sizeof(NtHdr), SecHdrs7, sizeof(SecHdrs7));
+  memcpy(HeaderPage.data() + DosHdr.e_lfanew + sizeof(NtHdr), SecHdrs8, sizeof(SecHdrs8));
 
   // Concatenate all sections + COFF Symbol Table + COFF String Table into OutDualPECOFF
   OutDualPECOFF.reserve(TotalImageSize + SymTab.size() * sizeof(COFFSymbol18) + StrTab.size());
@@ -750,6 +892,56 @@ bool BuildDualPECOFFAndFXCCContainer(
                        reinterpret_cast<const uint8_t*>(StrTab.data()) + StrTab.size());
 
   return true;
+}
+
+bool LookupDeoptEntryByHostRVA(std::span<const uint8_t> ContainerBytes,
+                               uint32_t HostRVA,
+                               FEXAOTDeoptEntry& OutEntry) {
+  if (ContainerBytes.size() < PE_PAGE_SIZE) return false;
+  PEDosHeader Dos {};
+  memcpy(&Dos, ContainerBytes.data(), sizeof(Dos));
+  if (Dos.e_magic != 0x5A4D || Dos.e_lfanew + sizeof(PENtHeaders64) > ContainerBytes.size()) return false;
+
+  PENtHeaders64 Nt {};
+  memcpy(&Nt, ContainerBytes.data() + Dos.e_lfanew, sizeof(Nt));
+  const size_t SecHdrOff = Dos.e_lfanew + sizeof(PENtHeaders64);
+  const uint16_t NumSecs = Nt.FileHeader.NumberOfSections;
+  if (SecHdrOff + NumSecs * sizeof(PESectionHeader) > ContainerBytes.size()) return false;
+
+  const auto* Secs = reinterpret_cast<const PESectionHeader*>(ContainerBytes.data() + SecHdrOff);
+  for (uint16_t i = 0; i < NumSecs; ++i) {
+    std::string SName(Secs[i].Name, strnlen(Secs[i].Name, 8));
+    if (SName == ".rdata" && Secs[i].PointerToRawData + Secs[i].SizeOfRawData <= ContainerBytes.size()) {
+      const uint8_t* RBase = ContainerBytes.data() + Secs[i].PointerToRawData;
+      const size_t RSize = Secs[i].SizeOfRawData;
+      for (size_t Off = 0; Off + sizeof(FEXAOTDeoptHeader) <= RSize; Off += 16) {
+        if (memcmp(RBase + Off, "FXDP", 4) == 0) {
+          FEXAOTDeoptHeader Hdr {};
+          memcpy(&Hdr, RBase + Off, sizeof(Hdr));
+          size_t TableOff = Off + sizeof(FEXAOTDeoptHeader);
+          if (TableOff + size_t(Hdr.NumEntries) * sizeof(FEXAOTDeoptEntry) <= RSize) {
+            const auto* Entries = reinterpret_cast<const FEXAOTDeoptEntry*>(RBase + TableOff);
+            // Binary search for HostRVA in [HostStartRVA, HostEndRVA)
+            size_t Lo = 0, Hi = Hdr.NumEntries;
+            while (Lo < Hi) {
+              size_t Mid = Lo + (Hi - Lo) / 2;
+              if (Entries[Mid].HostEndRVA <= HostRVA) {
+                Lo = Mid + 1;
+              } else {
+                Hi = Mid;
+              }
+            }
+            if (Lo < Hdr.NumEntries && HostRVA >= Entries[Lo].HostStartRVA && HostRVA < Entries[Lo].HostEndRVA) {
+              OutEntry = Entries[Lo];
+              return true;
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 bool AuditPECOFFContainer(std::span<const uint8_t> ContainerBytes,
@@ -801,7 +993,7 @@ bool AuditPECOFFContainer(std::span<const uint8_t> ContainerBytes,
                                       : Nt.FileHeader.Machine;
 
   std::ostringstream OS;
-  OS << "=== PE/COFF Arm64EC + FEX FXCC Dual Container Audit ===\n";
+  OS << "=== PE/COFF Arm64EC + FEX FXCC Dual-Tier Container Audit ===\n";
   OS << "Container Size         : " << ContainerBytes.size() << " bytes\n";
   OS << "COFF Effective Machine : 0x" << std::hex << EffectiveMachine << std::dec
      << (EffectiveMachine == IMAGE_FILE_MACHINE_ARM64EC_VAL ? " (IMAGE_FILE_MACHINE_ARM64EC)" : "") << "\n";
@@ -822,7 +1014,7 @@ bool AuditPECOFFContainer(std::span<const uint8_t> ContainerBytes,
   FEXAOTPEManifest Manifest {};
   memcpy(&Manifest, ContainerBytes.data() + 0x40, sizeof(Manifest));
   if (memcmp(Manifest.Magic, "FXPE", 4) == 0) {
-    OS << "\n--- Embedded FEXAOTPEManifest (FXPE) ---\n";
+    OS << "\n--- Embedded FEXAOTPEManifest (FXPE v" << Manifest.Version << ") ---\n";
     OS << "  SourceFileId         : 0x" << std::hex << Manifest.SourceFileId << "\n";
     OS << "  CodeCacheConfigId    : 0x" << Manifest.CodeCacheConfigId << "\n";
     OS << "  SourceImageBase      : 0x" << Manifest.SourceImageBase << "\n";
@@ -844,15 +1036,19 @@ bool AuditPECOFFContainer(std::span<const uint8_t> ContainerBytes,
     OS << "  NumCodePages         : " << FxHdr.NumCodePages << "\n";
     OS << "  CodeBufferSize       : " << FxHdr.CodeBufferSize << " bytes\n";
     OS << "  NumRelocations       : " << FxHdr.NumRelocations << "\n";
-    OS << "  Flags                : 0x" << std::hex << FxHdr.Flags << std::dec << " (LLVM_AOT_O2 | PE_COFF_CONTAINER | PROTECTED_AOT)\n";
+    OS << "  Flags                : 0x" << std::hex << FxHdr.Flags << std::dec
+       << " (LLVM_AOT_O2 | PE_COFF_CONTAINER | PROTECTED_AOT | DUAL_ABI_EC_FEX | SEH_DEOPT_TABLE)\n";
   }
 
   // List PE Sections
   OS << "\n--- PE32+ Sections (" << NumSecs << ") ---\n";
 #ifdef FEX_HAS_LLVM_AOT
-  const uint8_t* TextData = nullptr;
-  size_t TextSize = 0;
-  uint64_t TextRVA = 0;
+  const uint8_t* TextEcData = nullptr;
+  size_t TextEcSize = 0;
+  uint64_t TextEcRVA = 0;
+  const uint8_t* TextFexData = nullptr;
+  size_t TextFexSize = 0;
+  uint64_t TextFexRVA = 0;
   const uint8_t* WowThkData = nullptr;
   size_t WowThkSize = 0;
   uint64_t WowThkRVA = 0;
@@ -869,10 +1065,14 @@ bool AuditPECOFFContainer(std::span<const uint8_t> ContainerBytes,
     OS << Line;
 #ifdef FEX_HAS_LLVM_AOT
     if (S.PointerToRawData + SSize <= ContainerBytes.size()) {
-      if (SName == ".text") {
-        TextData = ContainerBytes.data() + S.PointerToRawData;
-        TextSize = SSize;
-        TextRVA = SRVA;
+      if (SName == ".text_ec" || SName == ".text") {
+        TextEcData = ContainerBytes.data() + S.PointerToRawData;
+        TextEcSize = SSize;
+        TextEcRVA = SRVA;
+      } else if (SName == ".text_fx" || SName == ".text_fex" || SName == ".text_fe") {
+        TextFexData = ContainerBytes.data() + S.PointerToRawData;
+        TextFexSize = SSize;
+        TextFexRVA = SRVA;
       } else if (SName == ".wowthk") {
         WowThkData = ContainerBytes.data() + S.PointerToRawData;
         WowThkSize = SSize;
@@ -890,32 +1090,51 @@ bool AuditPECOFFContainer(std::span<const uint8_t> ContainerBytes,
   LLVMInitializeAArch64Disassembler();
 
   LLVMDisasmContextRef Disasm = LLVMCreateDisasm("aarch64-pc-windows-msvc", nullptr, 0, nullptr, nullptr);
-  if (Disasm && TextData && TextSize > 0) {
-    OS << "\n--- Sample AArch64 Disassembly from .text (RVA 0x" << std::hex << TextRVA << std::dec << ") ---\n";
-    size_t MaxOff = DisassembleAll ? TextSize : std::min<size_t>(TextSize, 96);
+  if (Disasm && TextEcData && TextEcSize > 0) {
+    OS << "\n--- Sample AArch64 Disassembly from .text_ec (RVA 0x" << std::hex << TextEcRVA << std::dec << ") ---\n";
+    size_t MaxOff = DisassembleAll ? TextEcSize : std::min<size_t>(TextEcSize, 96);
     for (size_t Off = 4; Off + 4 <= MaxOff; Off += 4) {
       uint32_t Word = 0;
-      memcpy(&Word, TextData + Off, 4);
+      memcpy(&Word, TextEcData + Off, 4);
       if (Word == 0) continue;
       char OutStr[128] = {};
       size_t InstLen = LLVMDisasmInstruction(
         Disasm,
-        const_cast<uint8_t*>(TextData + Off),
-        4, TextRVA + Off, OutStr, sizeof(OutStr));
+        const_cast<uint8_t*>(TextEcData + Off),
+        4, TextEcRVA + Off, OutStr, sizeof(OutStr));
       char Line[192];
       snprintf(Line, sizeof(Line), "  0x%08llx: %08x  %s\n",
-               static_cast<unsigned long long>(TextRVA + Off), Word,
+               static_cast<unsigned long long>(TextEcRVA + Off), Word,
+               InstLen ? OutStr : "\t.word");
+      OS << Line;
+    }
+  }
+  if (Disasm && TextFexData && TextFexSize > 0) {
+    OS << "\n--- Sample AArch64 Disassembly from .text_fex (RVA 0x" << std::hex << TextFexRVA << std::dec << ") ---\n";
+    size_t MaxOff = DisassembleAll ? TextFexSize : std::min<size_t>(TextFexSize, 64);
+    for (size_t Off = 0; Off + 4 <= MaxOff; Off += 4) {
+      uint32_t Word = 0;
+      memcpy(&Word, TextFexData + Off, 4);
+      if (Word == 0) continue;
+      char OutStr[128] = {};
+      size_t InstLen = LLVMDisasmInstruction(
+        Disasm,
+        const_cast<uint8_t*>(TextFexData + Off),
+        4, TextFexRVA + Off, OutStr, sizeof(OutStr));
+      char Line[192];
+      snprintf(Line, sizeof(Line), "  0x%08llx: %08x  %s\n",
+               static_cast<unsigned long long>(TextFexRVA + Off), Word,
                InstLen ? OutStr : "\t.word");
       OS << Line;
     }
   }
   if (Disasm && WowThkData && WowThkSize > 0) {
     OS << "\n--- Arm64EC Entry/Exit Thunk Disassembly from .wowthk (RVA 0x" << std::hex << WowThkRVA << std::dec << ") ---\n";
-    size_t MaxOff = std::min<size_t>(WowThkSize, 80);
+    size_t MaxOff = std::min<size_t>(WowThkSize, 96);
     for (size_t Off = 0; Off + 4 <= MaxOff; Off += 4) {
       uint32_t Word = 0;
       memcpy(&Word, WowThkData + Off, 4);
-      if (Word == 0) break;
+      if (Word == 0) continue;
       char OutStr[128] = {};
       LLVMDisasmInstruction(
         Disasm,

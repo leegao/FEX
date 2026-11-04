@@ -1,0 +1,17 @@
+GLIBC_2.34 {
+  global:
+    __isoc23_strtol;
+    __isoc23_strtoul;
+    __isoc23_strtoll;
+    __isoc23_strtoull;
+    __isoc23_sscanf;
+    __isoc23_fscanf;
+};
+GLIBCXX_3.4.30 {
+  global:
+    _ZSt21ios_base_library_initv;
+};
+CXXABI_1.3.13 {
+  global:
+    __cxa_call_terminate;
+};
