@@ -5,7 +5,7 @@ import stat
 import sys
 import zipfile
 
-EXCLUDED_TOP_DIRS = {".cache", "build", ".git", "archives", "External"}
+EXCLUDED_TOP_DIRS = {".cache", "build", ".git", "archives", "External", "kittytoy", "aot_out", "screenshots"}
 EXCLUDED_TOP_FILES = {"llvm.zip", "include.zip", "AGENTS.md", "CLAUDE.md", "archive.zip"}
 
 
@@ -13,7 +13,7 @@ def build_archive(target_file: str) -> None:
     target_abs = os.path.abspath(target_file)
     root_dir = os.getcwd()
     count = 0
-    with zipfile.ZipFile(target_abs, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    with zipfile.ZipFile(target_abs, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
             rel_dir = os.path.relpath(dirpath, root_dir)
             if rel_dir == ".":

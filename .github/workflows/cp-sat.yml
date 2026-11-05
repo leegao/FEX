@@ -61,9 +61,12 @@ jobs:
           ./symexec_verifier/fex_aot_symexec_verifier \
             aot_out/symexec_all_benchmarks.json \
             docs/OR_Tools_Symbolic_Equivalence_Report.md \
-            aot_out/symexec_report.json
+            aot_out/symexec_report.json \
+            aot_out/symexec_constraints_equations.txt \
+            aot_out/symbolic_ir_dump.txt
 
-      - name: Upload CP-SAT Equivalence Report Artifacts
+      - name: Upload CP-SAT Equivalence Report & Audit Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cp-sat-equivalence-report
@@ -71,3 +74,6 @@ jobs:
             docs/OR_Tools_Symbolic_Equivalence_Report.md
             aot_out/symexec_report.json
             aot_out/benchmark_summary.json
+            aot_out/symexec_constraints_equations.txt
+            aot_out/symbolic_ir_dump.txt
+            aot_out/symexec_all_benchmarks.json
