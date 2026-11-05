@@ -35,6 +35,14 @@ if (NOT MINGW)
   add_executable(fex-aot-pe EXCLUDE_FROM_ALL
     FEXAOTPECompiler.cpp
     "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVMArm64ECAOT.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/SafetyAnalysis.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/Lifter.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/LifterALU.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/LifterMemory.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/LifterVector.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/LifterFlags.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/BlockWrapper.cpp"
+    "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/LLVM/CompilationEngine.cpp"
     "${CMAKE_SOURCE_DIR}/FEXCore/Source/Interface/Core/AOT/PECOFFContainer.cpp")
   target_include_directories(fex-aot-pe PRIVATE
     "${CMAKE_SOURCE_DIR}/FEXCore/Source"
