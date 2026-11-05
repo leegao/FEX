@@ -42,6 +42,7 @@ jobs:
           ./build/Bin/fex-aot-pe \
             --output-dir aot_out \
             --audit \
+            --max-functions 5000 \
             --json-out aot_out/benchmark_summary.json \
             --dump-symexec-json aot_out/symexec_all_benchmarks.json \
             samples/hello64.exe \

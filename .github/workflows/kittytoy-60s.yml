@@ -112,6 +112,7 @@ jobs:
           ./build/Bin/fex-aot-pe \
             --output-dir aot_cache \
             --audit \
+            --max-functions 5000 \
             --json-out aot_cache/benchmark_kittytoy.json \
             kittytoy/KittyToy.exe
           ls -lh aot_cache/

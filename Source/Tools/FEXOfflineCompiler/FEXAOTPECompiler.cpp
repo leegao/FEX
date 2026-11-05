@@ -553,6 +553,8 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
   std::vector<FEXCore::AOT::Arm64ECThunkRecord> SRAThunks;
   double SRABatchMs = 0.0;
   SRACompiler.CompileModuleBatch(SRALiftedFunctions, ImgBase, SRACompiledBlocks, SRAThunks, SRABatchMs, nullptr);
+  SRALiftedFunctions.clear();
+  SRALiftedFunctions.shrink_to_fit();
 
   // Batch-compile all lifted functions with LLVM-Arm64EC -O2
   double BatchCompileMs = 0.0;

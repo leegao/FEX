@@ -306,6 +306,12 @@ public:
 
 private:
   Options Opts;
+  bool CompileSingleModuleChunk(const std::vector<LiftedFunctionIR>& LiftedFunctions,
+                                uint64_t SerializedBaseAddress,
+                                std::vector<CompiledAOTBlock>& OutBlocks,
+                                std::vector<Arm64ECThunkRecord>& OutThunks,
+                                double& OutBatchCompileMs,
+                                std::vector<double>* OutPerFnCompileUs) const;
 };
 
 // Serializes compiled AOT blocks into both:

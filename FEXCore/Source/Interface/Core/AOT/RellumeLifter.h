@@ -198,7 +198,9 @@ inline void EmitIntrinsicDeclarations(std::ostringstream& ModIR) {
   ModIR << "declare <8 x i16> @llvm.usub.sat.v8i16(<8 x i16>, <8 x i16>)\n";
   ModIR << "declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n";
   ModIR << "declare i16 @llvm.vector.reduce.add.v8i16(<8 x i16>)\n";
-  ModIR << "declare i8  @llvm.vector.reduce.add.v16i8(<16 x i8>)\n\n";
+  ModIR << "declare i8  @llvm.vector.reduce.add.v16i8(<16 x i8>)\n";
+  ModIR << "declare <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8>, <16 x i8>)\n";
+  ModIR << "declare <16 x i8> @llvm.aarch64.neon.tbl2.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)\n\n";
 }
 
 class Lifter {
