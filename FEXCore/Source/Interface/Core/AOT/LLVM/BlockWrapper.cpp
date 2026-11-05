@@ -61,7 +61,8 @@ BlockWrapper::BlockWrapper(const LLVMArm64ECAOTCompiler::Options& Opts_)
 CompiledAOTBlock
 BlockWrapper::Wrap(const LLVMArm64ECAOTCompiler::LiftedFunctionIR& Lifted,
                    std::span<const uint8_t> RawFuncBytes,
-                   uint64_t SerializedBaseAddress) const {
+                   uint64_t SerializedBaseAddress,
+                   std::span<const COFFConstPoolReloc> ConstRelocs) const {
   CompiledAOTBlock Block;
   Block.GuestEntryVA = Lifted.GuestEntryVA;
   Block.GuestEntryRVA = static_cast<uint32_t>(Lifted.GuestEntryVA - SerializedBaseAddress);
@@ -193,6 +194,7 @@ BlockWrapper::Wrap(const LLVMArm64ECAOTCompiler::LiftedFunctionIR& Lifted,
   }
 
   // 3. Emit CompactWords, recording where each `.inst (0x5000 + ExitId)` marker sits
+  const uint32_t BodyStartOffset = static_cast<uint32_t>(Buf.size());
   struct PendingExitBranch {
     uint32_t BranchByteOffset;
     uint32_t ExitId;
@@ -422,6 +424,51 @@ BlockWrapper::Wrap(const LLVMArm64ECAOTCompiler::LiftedFunctionIR& Lifted,
   }
 
   Block.CodeOnlyBytes = static_cast<uint32_t>(Buf.size() - sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader));
+
+  // 5b. Materialize any COFF .rdata constant-pool sections referenced by ADRP+LDR/ADD relocations
+  // inline inside the block and rewrite `adrp Rd, sym` -> `adr Rd, #pc_rel_byte_offset`.
+  if (!ConstRelocs.empty()) {
+    std::map<uint16_t, uint32_t> SecOffsetInBlock;
+    for (const auto& Rel : ConstRelocs) {
+      if (!SecOffsetInBlock.contains(Rel.TargetSecNum) && !Rel.SecBytes.empty()) {
+        AlignBuf(16);
+        SecOffsetInBlock[Rel.TargetSecNum] = static_cast<uint32_t>(Buf.size());
+        Buf.insert(Buf.end(), Rel.SecBytes.begin(), Rel.SecBytes.end());
+        AlignBuf(16);
+      }
+    }
+    for (const auto& Rel : ConstRelocs) {
+      auto SecIt = SecOffsetInBlock.find(Rel.TargetSecNum);
+      if (SecIt == SecOffsetInBlock.end()) continue;
+      if (Rel.OldWordIdx >= OldToNewWordIdx.size()) continue;
+      uint32_t NewW = static_cast<uint32_t>(OldToNewWordIdx[Rel.OldWordIdx]);
+      uint32_t InsnOff = BodyStartOffset + NewW * 4;
+      if (InsnOff + 4 > Buf.size()) continue;
+      uint32_t Insn = 0;
+      memcpy(&Insn, Buf.data() + InsnOff, 4);
+      if (Rel.Type == 4 || Rel.Type == 5) { // IMAGE_REL_ARM64_PAGEBASE_REL21 (adrp) or REL21 (adr)
+        uint32_t TargetOff = SecIt->second;
+        int32_t ByteDelta = static_cast<int32_t>(TargetOff) - static_cast<int32_t>(InsnOff);
+        uint32_t Rd = Insn & 0x1Fu;
+        uint32_t Immlo = static_cast<uint32_t>(ByteDelta) & 0x3u;
+        uint32_t Immhi = (static_cast<uint32_t>(ByteDelta) >> 2) & 0x7FFFFu;
+        uint32_t AdrInsn = 0x10000000u | (Immlo << 29) | (Immhi << 5) | Rd;
+        PatchU32(InsnOff, AdrInsn);
+      } else if (Rel.Type == 7 && Rel.TargetSymOffset != 0) { // IMAGE_REL_ARM64_PAGEOFFSET_12L (ldr/str)
+        uint32_t ScaleLog2 = (Insn >> 30) & 0x3u;
+        if (((Insn & 0x04000000u) != 0) && ScaleLog2 == 0 && ((Insn & 0x00800000u) != 0)) {
+          ScaleLog2 = 4;
+        }
+        uint32_t CurImm12 = (Insn >> 10) & 0xFFFu;
+        uint32_t NewImm12 = (CurImm12 + (Rel.TargetSymOffset >> ScaleLog2)) & 0xFFFu;
+        PatchU32(InsnOff, (Insn & ~(0xFFFu << 10)) | (NewImm12 << 10));
+      } else if (Rel.Type == 6 && Rel.TargetSymOffset != 0) { // IMAGE_REL_ARM64_PAGEOFFSET_12A (add)
+        uint32_t CurImm12 = (Insn >> 10) & 0xFFFu;
+        uint32_t NewImm12 = (CurImm12 + Rel.TargetSymOffset) & 0xFFFu;
+        PatchU32(InsnOff, (Insn & ~(0xFFFu << 10)) | (NewImm12 << 10));
+      }
+    }
+  }
 
   // 6. Align to alignof(JITCodeTail) (8 bytes) and emit JITCodeTail + vl64pair RIP entries
   AlignBuf(alignof(FEXCore::CPU::CPUBackend::JITCodeTail));

@@ -159,6 +159,23 @@ std::string LifterContext::ZeroUpperFPRBits(const std::string& VecVal, unsigned 
   return VecVal;
 }
 
+std::string LifterContext::MakeVec128Const(uint64_t Lo, uint64_t Hi) {
+  if (Lo == 0 && Hi == 0) return "zeroinitializer";
+  if (Lo == ~0ULL && Hi == ~0ULL) return "<i64 -1, i64 -1>";
+  std::string Res = NextVal();
+  if (Hi == 0) {
+    OS << "  " << Res << " = call <2 x i64> asm \"fmov ${0:d}, $1\", \"=w,r\"(i64 "
+       << static_cast<int64_t>(Lo) << ")\n";
+  } else if (Lo == Hi) {
+    OS << "  " << Res << " = call <2 x i64> asm \"dup $0.2d, $1\", \"=w,r\"(i64 "
+       << static_cast<int64_t>(Lo) << ")\n";
+  } else {
+    OS << "  " << Res << " = call <2 x i64> asm \"fmov ${0:d}, $1 ; mov $0.d[1], $2\", \"=&w,r,r\"(i64 "
+       << static_cast<int64_t>(Lo) << ", i64 " << static_cast<int64_t>(Hi) << ")\n";
+  }
+  return Res;
+}
+
 std::string LifterContext::MaskToOpSize(const std::string& Val64, FEXCore::IR::OpSize Size) {
   unsigned Bits = OpSizeToBits(Size);
   if (Bits >= 64) return Val64;

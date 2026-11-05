@@ -7,13 +7,22 @@
 
 namespace FEXCore::AOT {
 
+struct COFFConstPoolReloc {
+  uint32_t OldWordIdx = 0;
+  uint16_t Type = 0;
+  uint16_t TargetSecNum = 0;
+  uint32_t TargetSymOffset = 0;
+  std::vector<uint8_t> SecBytes;
+};
+
 class BlockWrapper {
 public:
   explicit BlockWrapper(const LLVMArm64ECAOTCompiler::Options& Opts);
 
   CompiledAOTBlock Wrap(const LLVMArm64ECAOTCompiler::LiftedFunctionIR& Lifted,
                         std::span<const uint8_t> RawFuncBytes,
-                        uint64_t SerializedBaseAddress) const;
+                        uint64_t SerializedBaseAddress,
+                        std::span<const COFFConstPoolReloc> ConstRelocs = {}) const;
 
 private:
   const LLVMArm64ECAOTCompiler::Options& Opts;

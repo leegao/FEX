@@ -276,6 +276,11 @@ bool CompilationEngine::CompileSingleModuleChunk(const std::vector<LLVMArm64ECAO
     uint8_t StorageClass;
     uint8_t NumberOfAuxSymbols;
   };
+  struct RawCOFFRelocation {
+    uint32_t VirtualAddress;
+    uint32_t SymbolTableIndex;
+    uint16_t Type;
+  };
   #pragma pack(pop)
 
   if (ObjSize < sizeof(RawCOFFFileHeader)) {
@@ -346,6 +351,10 @@ bool CompilationEngine::CompileSingleModuleChunk(const std::vector<LLVMArm64ECAO
   }
 
   std::unordered_map<std::string, std::vector<uint8_t>> ExtractedFuncBytes;
+  std::unordered_map<std::string, std::vector<COFFConstPoolReloc>> ExtractedFuncRelocs;
+  const auto* RawSyms = (SymTableOff + size_t(FileHdr->NumberOfSymbols) * sizeof(RawCOFFSymbol) <= ObjSize)
+                          ? reinterpret_cast<const RawCOFFSymbol*>(ObjData + SymTableOff)
+                          : nullptr;
   for (const auto& Sym : ParsedSyms) {
     const RawCOFFSectionHeader& Sec = SecHdrs[Sym.SecNum - 1];
     if (Sec.PointerToRawData + Sec.SizeOfRawData > ObjSize) continue;
@@ -361,11 +370,41 @@ bool CompilationEngine::CompileSingleModuleChunk(const std::vector<LLVMArm64ECAO
     const uint8_t* Ptr = ObjData + Sec.PointerToRawData + Sym.Value;
     const size_t Len = EndOffset - Sym.Value;
 
+    auto ExtractSecRelocs = [&]() -> std::vector<COFFConstPoolReloc> {
+      std::vector<COFFConstPoolReloc> RelList;
+      if (!RawSyms || Sec.NumberOfRelocations == 0) return RelList;
+      if (Sec.PointerToRelocations + size_t(Sec.NumberOfRelocations) * sizeof(RawCOFFRelocation) > ObjSize) {
+        return RelList;
+      }
+      const auto* Relocs = reinterpret_cast<const RawCOFFRelocation*>(ObjData + Sec.PointerToRelocations);
+      for (uint16_t r = 0; r < Sec.NumberOfRelocations; ++r) {
+        const RawCOFFRelocation& Rel = Relocs[r];
+        if (Rel.VirtualAddress < Sym.Value || Rel.VirtualAddress + 4 > EndOffset) continue;
+        if (Rel.SymbolTableIndex >= FileHdr->NumberOfSymbols) continue;
+        const RawCOFFSymbol& TSym = RawSyms[Rel.SymbolTableIndex];
+        if (TSym.SectionNumber <= 0 || TSym.SectionNumber > int16_t(FileHdr->NumberOfSections)) continue;
+        if (TSym.SectionNumber == Sym.SecNum) continue;
+        const RawCOFFSectionHeader& TSec = SecHdrs[TSym.SectionNumber - 1];
+        if (TSec.SizeOfRawData == 0 || TSec.PointerToRawData + TSec.SizeOfRawData > ObjSize) continue;
+        COFFConstPoolReloc CPR {};
+        CPR.OldWordIdx = (Rel.VirtualAddress - Sym.Value) / 4;
+        CPR.Type = Rel.Type;
+        CPR.TargetSecNum = static_cast<uint16_t>(TSym.SectionNumber);
+        CPR.TargetSymOffset = TSym.Value;
+        CPR.SecBytes.assign(ObjData + TSec.PointerToRawData,
+                            ObjData + TSec.PointerToRawData + TSec.SizeOfRawData);
+        RelList.push_back(std::move(CPR));
+      }
+      return RelList;
+    };
+
     if (Sym.Name.starts_with("#fex_fn_")) {
       std::string BaseFn = Sym.Name.substr(1); // strip leading '#'
       ExtractedFuncBytes[BaseFn] = std::vector<uint8_t>(Ptr, Ptr + Len);
+      ExtractedFuncRelocs[BaseFn] = ExtractSecRelocs();
     } else if (Sym.Name.starts_with("fex_fn_") && !ExtractedFuncBytes.contains(Sym.Name)) {
       ExtractedFuncBytes[Sym.Name] = std::vector<uint8_t>(Ptr, Ptr + Len);
+      ExtractedFuncRelocs[Sym.Name] = ExtractSecRelocs();
     } else if (Sym.Name.starts_with("$ientry_thunk$") || Sym.Name.starts_with("$iexit_thunk$")) {
       Arm64ECThunkRecord Thk {};
       Thk.Name = Sym.Name;
@@ -391,7 +430,12 @@ bool CompilationEngine::CompileSingleModuleChunk(const std::vector<LLVMArm64ECAO
     if (It != ExtractedFuncBytes.end()) {
       RawSpan = It->second;
     }
-    OutBlocks.push_back(Wrapper.Wrap(Lifted, RawSpan, SerializedBaseAddress));
+    std::span<const COFFConstPoolReloc> RelSpan;
+    auto RelIt = ExtractedFuncRelocs.find(Lifted.FunctionName);
+    if (RelIt != ExtractedFuncRelocs.end()) {
+      RelSpan = RelIt->second;
+    }
+    OutBlocks.push_back(Wrapper.Wrap(Lifted, RawSpan, SerializedBaseAddress, RelSpan));
   }
 
   LLVMDisposeMemoryBuffer(ObjBuf);

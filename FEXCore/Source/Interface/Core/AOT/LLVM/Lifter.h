@@ -58,6 +58,7 @@ struct LifterContext {
   void StoreFPRDest(FEXCore::IR::Ref Node, const std::string& VecVal);
   void StoreFPRWrapper(FEXCore::IR::OrderedNodeWrapper W, const std::string& VecVal);
   std::string ZeroUpperFPRBits(const std::string& VecVal, unsigned KeepBits);
+  std::string MakeVec128Const(uint64_t Lo, uint64_t Hi);
   std::string MaskToOpSize(const std::string& Val64, FEXCore::IR::OpSize Size);
   std::string ComputeEffectiveAddress(FEXCore::IR::OrderedNodeWrapper BaseW,
                                      FEXCore::IR::OrderedNodeWrapper OffsetW,

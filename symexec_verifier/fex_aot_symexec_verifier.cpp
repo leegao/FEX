@@ -496,7 +496,35 @@ static DecodedAArch64Inst DecodeSingleAArch64Word(uint32_t w) {
     D.Rm = (w >> 16) & 0x1Fu;
     D.Rn = (w >> 5) & 0x1Fu;
     D.Rd = w & 0x1Fu;
-    snprintf(buf, sizeof(buf), "tbx v%u.16b, {v%u.16b}, v%u.16b", D.Rd, D.Rn, D.Rm);
+    const char* mn = ((w >> 12) & 1u) ? "tbx" : "tbl";
+    snprintf(buf, sizeof(buf), "%s v%u.16b, {v%u.16b}, v%u.16b", mn, D.Rd, D.Rn, D.Rm);
+    D.Disasm = buf;
+    return D;
+  }
+  // 13b. FMOV dD, xN / MOV vD.d[1], xN / DUP vD.2d, xN (inline 128-bit vector constant materialization)
+  if ((w & 0xFFFFFC00u) == 0x9E670000u || (w & 0xFFFFFC00u) == 0x4E181C00u || (w & 0xFFFFFC00u) == 0x4E080C00u) {
+    D.Op = AArch64SymbolicOp::VEC_ARITH;
+    D.Rn = (w >> 5) & 0x1Fu;
+    D.Rd = w & 0x1Fu;
+    if ((w & 0xFFFFFC00u) == 0x9E670000u) {
+      snprintf(buf, sizeof(buf), "fmov d%u, x%u", D.Rd, D.Rn);
+    } else if ((w & 0xFFFFFC00u) == 0x4E181C00u) {
+      snprintf(buf, sizeof(buf), "mov v%u.d[1], x%u", D.Rd, D.Rn);
+    } else {
+      snprintf(buf, sizeof(buf), "dup v%u.2d, x%u", D.Rd, D.Rn);
+    }
+    D.Disasm = buf;
+    return D;
+  }
+  // 13c. ADR Rd, #imm21 (PC-relative inline constant pool address)
+  if ((w & 0x9F000000u) == 0x10000000u) {
+    D.Op = AArch64SymbolicOp::ADD_IMM;
+    D.Rd = w & 0x1Fu;
+    D.Rn = 31;
+    int32_t immlo = (w >> 29) & 0x3u;
+    int32_t immhi = static_cast<int32_t>((w >> 5) << 13) >> 11;
+    D.Imm = immhi | immlo;
+    snprintf(buf, sizeof(buf), "adr x%u, #%lld", D.Rd, (long long)D.Imm);
     D.Disasm = buf;
     return D;
   }
@@ -1617,7 +1645,9 @@ int main(int argc, char** argv) {
     ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_140e477b0 (.text_fx Godot bytecode VM)",
       "Godot 3.5.3 GDScript opcode evaluator in .text_fx with pinned SRA registers (6,475 JIT -> 117 SRA insts, 521 BBs)", 1798, 117, 117, 6475, 3, PCOut, PSOut),
     ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_140acbdf0 (.text_ec Godot memory pool)",
-      "Godot 3.5.3 MemoryPool memory manager & page allocator in .text_ec (11,421 JIT -> 31 EC insts, 496 BBs)", 1715, 31, 51, 11421, 2, PCOut, PSOut)
+      "Godot 3.5.3 MemoryPool memory manager & page allocator in .text_ec (11,421 JIT -> 31 EC insts, 496 BBs)", 1715, 31, 51, 11421, 2, PCOut, PSOut),
+    ProveRepFunctionEquivalence("kittytoy.exe", "ConvertBGRAToRGBA_SSE2 (fex_fn_1405c4a40)",
+      "Godot 3.5.3 libwebp BGRA->RGBA SSE2 pshuflw/pshufhw TBL shuffle with inline fmov/mov vector constants in .text_ec", 123, 149, 179, 326, 0, PCOut, PSOut)
   };
 
   std::cout << "\n----------------------------------------------------------------------------------------------------\n";

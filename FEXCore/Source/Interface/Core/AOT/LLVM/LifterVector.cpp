@@ -38,6 +38,7 @@ bool LiftVectorOp(LifterContext& Ctx, FEXCore::IR::Ref CodeNode, const FEXCore::
   auto StoreFPRDest = [&](FEXCore::IR::Ref Node, const std::string& Val) { Ctx.StoreFPRDest(Node, Val); };
   auto StoreFPRWrapper = [&](FEXCore::IR::OrderedNodeWrapper W, const std::string& Val) { Ctx.StoreFPRWrapper(W, Val); };
   auto ZeroUpperFPRBits = [&](const std::string& Val, unsigned B) { return Ctx.ZeroUpperFPRBits(Val, B); };
+  auto MakeVec128Const = [&](uint64_t Lo, uint64_t Hi) { return Ctx.MakeVec128Const(Lo, Hi); };
   auto MaskToOpSize = [&](const std::string& Val, FEXCore::IR::OpSize S) { return Ctx.MaskToOpSize(Val, S); };
   auto ComputeEffectiveAddress = [&](FEXCore::IR::OrderedNodeWrapper B, FEXCore::IR::OrderedNodeWrapper O, FEXCore::IR::MemOffsetType T, uint8_t S) {
     return Ctx.ComputeEffectiveAddress(B, O, T, S);
@@ -49,7 +50,7 @@ bool LiftVectorOp(LifterContext& Ctx, FEXCore::IR::Ref CodeNode, const FEXCore::
 
   (void)NextVal; (void)LoadGPROperand; (void)StoreGPRDest; (void)StoreGPRWrapper;
   (void)LoadFPROperand; (void)StoreFPRDest; (void)StoreFPRWrapper;
-  (void)ZeroUpperFPRBits; (void)MaskToOpSize; (void)ComputeEffectiveAddress;
+  (void)ZeroUpperFPRBits; (void)MakeVec128Const; (void)MaskToOpSize; (void)ComputeEffectiveAddress;
   (void)PackNZCVFromAddSub; (void)EvaluateNZCVCond;
 
   switch (IROp->Op) {
@@ -109,8 +110,7 @@ bool LiftVectorOp(LifterContext& Ctx, FEXCore::IR::Ref CodeNode, const FEXCore::
         if (Idx < 42) {
           uint64_t Lo = kNamedConsts[Idx][0];
           uint64_t Hi = (Bits <= 64) ? 0ULL : kNamedConsts[Idx][1];
-          std::string VecLit = "<i64 " + std::to_string(Lo) + ", i64 " + std::to_string(Hi) + ">";
-          StoreFPRDest(CodeNode, VecLit);
+          StoreFPRDest(CodeNode, MakeVec128Const(Lo, Hi));
         } else {
           StoreFPRDest(CodeNode, "zeroinitializer");
         }
@@ -176,8 +176,7 @@ bool LiftVectorOp(LifterContext& Ctx, FEXCore::IR::Ref CodeNode, const FEXCore::
         default: break;
         }
         if (Bits <= 64) Hi = 0;
-        std::string VecLit = "<i64 " + std::to_string(Lo) + ", i64 " + std::to_string(Hi) + ">";
-        StoreFPRDest(CodeNode, VecLit);
+        StoreFPRDest(CodeNode, MakeVec128Const(Lo, Hi));
         break;
       }
 
@@ -376,9 +375,7 @@ bool LiftVectorOp(LifterContext& Ctx, FEXCore::IR::Ref CodeNode, const FEXCore::
           }
         }
         uint64_t Hi64 = (Bits <= 64) ? 0ULL : Val64;
-        std::string VecLit = "<i64 " + std::to_string(static_cast<int64_t>(Val64)) +
-                             ", i64 " + std::to_string(static_cast<int64_t>(Hi64)) + ">";
-        StoreFPRDest(CodeNode, VecLit);
+        StoreFPRDest(CodeNode, MakeVec128Const(Val64, Hi64));
         break;
       }
 
@@ -555,6 +552,11 @@ bool LiftVectorOp(LifterContext& Ctx, FEXCore::IR::Ref CodeNode, const FEXCore::
       }
 
       case FEXCore::IR::OP_VEXTR: {
+        if (getenv("FEX_TRACE_VEC")) {
+          auto* OpX = IROp->C<FEXCore::IR::IROp_VExtr>();
+          fprintf(stderr, "[TRACE_VEXTR] Fn=0x%llx Bits=%u ElemBits=%u Idx=%u\n",
+                  (unsigned long long)GuestEntryVA, Bits, OpSizeToBits(IROp->ElementSize), (unsigned)OpX->Index);
+        }
         auto* Op = IROp->C<FEXCore::IR::IROp_VExtr>();
         unsigned ElemBytes = OpSizeToBits(IROp->ElementSize) / 8;
         if (ElemBytes == 0) ElemBytes = 1;

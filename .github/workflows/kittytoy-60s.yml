@@ -21,6 +21,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build python3 curl tar xz-utils xvfb \
             libpulse0 libasound2t64 libgl1 libvulkan1 clang llvm-dev libclang-dev \
+            libx11-6 libxext6 libxrender1 libxrandr2 libxi6 libxcursor1 libxfixes3 \
+            libxinerama1 libxxf86vm1 libfreetype6 fontconfig \
             imagemagick x11-utils procps
 
       - name: Install llvm-mingw toolchain (aarch64)
@@ -133,14 +135,21 @@ jobs:
           cp -fv aot_cache/*.aot.dll "$CACHE_DEST/"
           cp -fv aot_cache/*.fxcc "$CACHE_DEST/" 2>/dev/null || true
 
-          # Initialize Wineprefix if not present
-          xvfb-run -a wineboot -u || true
-
-          # Launch Xvfb virtual frame buffer
-          Xvfb :99 -screen 0 1280x720x24 -ac &
+          # Clean any stale X11 locks/sockets and launch persistent Xvfb BEFORE wineboot
+          # (Avoid running xvfb-run -a prior to Xvfb :99, as xvfb-run's async SIGTERM cleanup
+          # unlinks /tmp/.X11-unix/X99 and causes explorer.exe / winex11.drv nodrv_CreateWindow!)
+          rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+          Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX +render -noreset &
           XVFB_PID=$!
           export DISPLAY=:99
-          sleep 2
+          for w in $(seq 1 20); do
+            [ -S /tmp/.X11-unix/X99 ] && break
+            sleep 0.2
+          done
+
+          # Initialize Wineprefix on the active persistent :99 display and wait for wineboot
+          wine wineboot -u || true
+          wineserver -w || true
 
           # Background periodic screenshot taker (every 5 seconds up to 60s)
           (
