@@ -1,0 +1,188 @@
+name: KittyToy 60s Game Bring-Up CI (llvm-aot)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-kittytoy-60s:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 curl tar xz-utils xvfb \
+            libpulse0 libasound2t64 libgl1 libvulkan1 clang llvm-dev libclang-dev \
+            imagemagick x11-utils procps
+
+      - name: Install llvm-mingw toolchain (aarch64)
+        run: |
+          LLVM_MINGW_URL="https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-aarch64.tar.xz"
+          mkdir -p /opt/llvm-mingw
+          curl -sSL "$LLVM_MINGW_URL" | tar -xJ -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> $GITHUB_PATH
+
+      - name: Fetch and unpack DroidDeck-Proton 11-11.9
+        run: |
+          PROTON_URL="https://github.com/Droid-Deck/DroidDeck-Proton/releases/download/DroidDeck-Proton-11-11.9/DroidDeck-Proton-11-11.9-aarch64.tar.gz"
+          mkdir -p /opt/droiddeck-proton
+          curl -sSL "$PROTON_URL" | tar -xz -C /opt/droiddeck-proton --strip-components=1
+
+      - name: Build FEX wow64 plugin
+        run: |
+          cmake -S . -B build_wow64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=aarch64-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False \
+            -DTUNE_ARCH=generic \
+            -DTUNE_CPU=none \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_wow64
+          DESTDIR="$PWD/install_fex" cmake --build build_wow64 -t install
+
+      - name: Build FEX wow64 UnixLib (.so)
+        run: |
+          cmake -S Source/Windows/UnixLib -B build_unixlib_wow64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-unix \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build_unixlib_wow64
+          DESTDIR="$PWD/install_fex" cmake --build build_unixlib_wow64 -t install
+
+      - name: Build FEX arm64ec plugin
+        run: |
+          cmake -S . -B build_arm64ec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False \
+            -DTUNE_ARCH=generic \
+            -DTUNE_CPU=none \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_arm64ec
+          DESTDIR="$PWD/install_fex" cmake --build build_arm64ec -t install
+
+      - name: Build FEX arm64ec UnixLib (.so)
+        run: |
+          cmake -S Source/Windows/UnixLib -B build_unixlib_arm64ec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-unix \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build_unixlib_arm64ec
+          DESTDIR="$PWD/install_fex" cmake --build build_unixlib_arm64ec -t install
+
+      - name: Install FEX plugins into DroidDeck-Proton
+        run: |
+          WIN_DIR="/opt/droiddeck-proton/files/lib/wine/aarch64-windows"
+          UNIX_DIR="/opt/droiddeck-proton/files/lib/wine/aarch64-unix"
+
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libwow64fex.dll "$WIN_DIR/libwow64fex.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-unix/libwow64fex.so "$UNIX_DIR/libwow64fex.so"
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libwow64fex.dll "$WIN_DIR/wow64cpu.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-windows/libarm64ecfex.dll "$WIN_DIR/libarm64ecfex.dll"
+          cp -fv install_fex/usr/lib/wine/aarch64-unix/libarm64ecfex.so "$UNIX_DIR/libarm64ecfex.so"
+
+      - name: Build FEX LLVM-Arm64EC AOT Compiler (fex-aot-pe)
+        run: |
+          chmod +x ./mk-fex-aot-pe.sh
+          ./mk-fex-aot-pe.sh
+
+      - name: AOT compile KittyToy.exe into Dual-Tier Arm64EC .aot.dll cache
+        run: |
+          mkdir -p aot_cache
+          ./build/Bin/fex-aot-pe \
+            --output-dir aot_cache \
+            --audit \
+            --json-out aot_cache/benchmark_kittytoy.json \
+            kittytoy/KittyToy.exe
+          ls -lh aot_cache/
+
+      - name: Run KittyToy for 60 seconds with 5-second periodic screenshot capture
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wineprefix
+          PATH: /opt/droiddeck-proton/files/bin:/opt/llvm-mingw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: /opt/droiddeck-proton/files/lib/aarch64-linux-gnu:/opt/droiddeck-proton/files/lib/wine/aarch64-unix
+          FEX_APP_CACHE_LOCATION: 'C:\fex-cache\'
+          FEX_ENABLECODECACHINGWIP: 1
+          FEX_SILENTLOG: 0
+          FEX_OUTPUTLOG: stderr
+        run: |
+          mkdir -p screenshots
+          CACHE_DEST="${{ github.workspace }}/wineprefix/drive_c/fex-cache/cache"
+          mkdir -p "$CACHE_DEST"
+          cp -fv aot_cache/*.aot.dll "$CACHE_DEST/"
+          cp -fv aot_cache/*.fxcc "$CACHE_DEST/" 2>/dev/null || true
+
+          # Initialize Wineprefix if not present
+          xvfb-run -a wineboot -u || true
+
+          # Launch Xvfb virtual frame buffer
+          Xvfb :99 -screen 0 1280x720x24 -ac &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          sleep 2
+
+          # Background periodic screenshot taker (every 5 seconds up to 60s)
+          (
+            for i in $(seq 1 12); do
+              sleep 5
+              SEC=$((i * 5))
+              SEC_STR=$(printf "%02d" $SEC)
+              echo "[KittyToy Runner] Capturing screenshot at ${SEC}s..."
+              import -window root "screenshots/kittytoy_${SEC_STR}s.png" 2>/dev/null || \
+                xwd -root -silent -out "screenshots/kittytoy_${SEC_STR}s.xwd" 2>/dev/null || true
+              if [ -f "screenshots/kittytoy_${SEC_STR}s.xwd" ] && [ ! -f "screenshots/kittytoy_${SEC_STR}s.png" ]; then
+                convert "screenshots/kittytoy_${SEC_STR}s.xwd" "screenshots/kittytoy_${SEC_STR}s.png" 2>/dev/null || true
+              fi
+            done
+            echo "[KittyToy Runner] 60-second execution complete! Shutting down KittyToy..."
+            pkill -f "KittyToy.exe" 2>/dev/null || true
+            sleep 2
+            pkill -9 -f "KittyToy.exe" 2>/dev/null || true
+            wineserver -k 2>/dev/null || true
+          ) &
+          SHOT_PID=$!
+
+          # Execute KittyToy with its data pack in kittytoy/
+          (
+            cd kittytoy
+            wine KittyToy.exe 2>&1 | tee ../kittytoy_run.log || true
+          )
+
+          wait $SHOT_PID 2>/dev/null || true
+          kill $XVFB_PID 2>/dev/null || true
+
+          echo "=== Captured Screenshots ==="
+          ls -la screenshots/
+
+      - name: Upload KittyToy 60s screenshots and execution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kittytoy-60s-screenshots
+          path: |
+            screenshots/kittytoy_*.png
+            screenshots/kittytoy_*.xwd
+            kittytoy_run.log
+            aot_cache/*.json
+          if-no-files-found: ignore
+          retention-days: 60

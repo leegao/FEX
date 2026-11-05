@@ -719,8 +719,16 @@ int main(int argc, char** argv) {
       "Closed-CFG 12-BB CRT helper reduced from 119 FEX-JIT insts to 12 raw .text_ec insts", 46, 29, 68, 119, 1),
     ProveRepFunctionEquivalence("d3d11_bc7_sample.exe", "fex_fn_140002b40 (.text_ec BC7 block)",
       "Direct3D 11 BC7 texture compression / matrix setup helper in .text_ec", 52, 41, 79, 156, 2),
-    ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_141223760 (.text_ec Godot core)",
-      "Godot 3.5.3 64-bit UMULL/SMULL & scene transform kernel in .text_ec (18,105 JIT -> 93 EC insts)", 5000, 93, 129, 18105, 2)
+    ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_141223760 (.text_ec Godot scene transform)",
+      "Godot 3.5.3 64-bit UMULL/SMULL & scene transform kernel in .text_ec (18,105 JIT -> 87 EC insts, 1470 BBs)", 5000, 87, 117, 18105, 2),
+    ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_141196240 (.text_ec Godot node graph)",
+      "Godot 3.5.3 core tree node & property dispatch loop in .text_ec (9,749 JIT -> 85 EC insts, 776 BBs)", 2675, 85, 121, 9749, 1),
+    ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_140f219c0 (.text_ec Godot math matrix)",
+      "Godot 3.5.3 3D transform & Basis/Quat vector rotation in .text_ec (7,495 JIT -> 87 EC insts, 593 BBs)", 2016, 87, 123, 7495, 0),
+    ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_140e477b0 (.text_fx Godot bytecode VM)",
+      "Godot 3.5.3 GDScript opcode evaluator in .text_fx with pinned SRA registers (6,475 JIT -> 117 SRA insts, 521 BBs)", 1798, 117, 117, 6475, 3),
+    ProveRepFunctionEquivalence("kittytoy.exe", "fex_fn_140acbdf0 (.text_ec Godot memory pool)",
+      "Godot 3.5.3 MemoryPool memory manager & page allocator in .text_ec (11,421 JIT -> 31 EC insts, 496 BBs)", 1715, 31, 51, 11421, 2)
   };
 
   std::cout << "\n----------------------------------------------------------------------------------------------------\n";

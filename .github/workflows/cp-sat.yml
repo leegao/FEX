@@ -35,6 +35,10 @@ jobs:
       - name: Dump 4-Way Lifted/Lowered/JIT JSON Across Benchmark & Game Binaries
         run: |
           mkdir -p aot_out docs
+          EXTRA_BINS=()
+          if [ -f kittytoy/KittyToy.exe ]; then
+            EXTRA_BINS+=(kittytoy/KittyToy.exe)
+          fi
           ./build/Bin/fex-aot-pe \
             --output-dir aot_out \
             --audit \
@@ -43,7 +47,8 @@ jobs:
             samples/hello64.exe \
             samples/fex_arm64ec_test.exe \
             samples/d3d11_bc7_sample.exe \
-            samples/fex_arm64ec_e2e_suite.exe
+            samples/fex_arm64ec_e2e_suite.exe \
+            "${EXTRA_BINS[@]}"
 
       - name: Build and Run Google OR-Tools CP-SAT 4-Way Symbolic Equivalence Verifier
         run: |
