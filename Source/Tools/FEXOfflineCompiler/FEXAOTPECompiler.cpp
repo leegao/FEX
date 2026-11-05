@@ -402,8 +402,8 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
   OfflineSyscallHandler SyscallHandler(ImgBase, ImgSize, FileInfo);
   CTX->SetSignalDelegator(&SigDelegator);
   CTX->SetSyscallHandler(&SyscallHandler);
-  CTX->InitCore();
   CTX->GetCodeCache().InitiateCacheGeneration();
+  CTX->InitCore();
 
   OutResult.Manifest.CodeCacheConfigId = FEXCore::AOT::ComputeCodeCacheConfigId(CTX, true);
 
@@ -472,6 +472,9 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
         Worklist.push_back(Site.CallReturnAddress);
       }
     }
+    if (Lifted.HasUnhandledIR) {
+      continue;
+    }
 
     // Benchmark FEX-JIT compilation time and code size on the exact same function
     auto T0 = std::chrono::steady_clock::now();
@@ -504,7 +507,7 @@ static bool CompileAndPackagePEBinary(const std::string& Path,
     FnInfo.FEXJITCompileTimeUs = FexUs;
     FnInfo.SymbolName = Lifted.FunctionName;
 
-    FnInfo.LLVMIRText = Lifted.LLVMIRBody;
+    // LLVMIRBody is consumed during batch compilation
     if (FexCodeOnlyBytes >= 4 && FexComp.CompiledCode.BlockBegin) {
       const uint32_t* WPtr = reinterpret_cast<const uint32_t*>(
         FexComp.CompiledCode.BlockBegin + sizeof(FEXCore::CPU::CPUBackend::JITCodeHeader));

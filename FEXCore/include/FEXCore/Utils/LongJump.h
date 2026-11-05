@@ -33,7 +33,7 @@ struct JumpBuf {
 };
 #endif
 
-[[nodiscard]] FEX_DEFAULT_VISIBILITY uint64_t SetJump(JumpBuf& Buffer);
+[[nodiscard]] __attribute__((returns_twice)) FEX_DEFAULT_VISIBILITY uint64_t SetJump(JumpBuf& Buffer);
 [[noreturn]] FEX_DEFAULT_VISIBILITY void LongJump(const JumpBuf& Buffer, uint64_t Value);
 FEX_DEFAULT_VISIBILITY void ManuallyLoadJumpBuf(const JumpBuf& Buffer, uint64_t Value, uint64_t* GPRs, __uint128_t* FPRs, uint64_t* PC);
 } // namespace FEXCore::UncheckedLongJump

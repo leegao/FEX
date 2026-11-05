@@ -879,12 +879,15 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   default: LOGMAN_MSG_A_FMT("Unhandled Arm64 restart condition!");
   }
 
+  IR = this->IR;
   uint32_t SSACount = IR->GetSSACount();
   JumpTargets.clear();
   CallReturnTargets.clear();
   PendingJumpThunks.clear();
   JumpTargets.resize(IR->GetHeader()->BlockCount, {});
-  Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
+  if (Relocations.size() > PrevNumAllocations) {
+    Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
+  }
 
   CodeData.EntryPoints.clear();
 

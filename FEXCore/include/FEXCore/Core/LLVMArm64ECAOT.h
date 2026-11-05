@@ -264,6 +264,7 @@ public:
     uint32_t GuestInstCount = 0;
     uint32_t BasicBlockCount = 0;
     bool SingleInst = false;
+    bool HasUnhandledIR = false;
     AOTTargetABI TargetABI = AOTTargetABI::FEX_SRA;
     FunctionSafetyAnalysis Safety {};
     std::string FunctionName;

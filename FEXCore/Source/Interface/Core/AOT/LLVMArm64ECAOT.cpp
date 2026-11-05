@@ -779,7 +779,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
   };
 
   auto StoreFPRDest = [&](FEXCore::IR::Ref Node, const std::string& VecVal) {
-    if (!UsesFPR) return;
+    if (!UsesFPR || !Node) return;
     FEXCore::IR::PhysicalRegister PR(Node);
     if (PR.IsInvalid()) return;
     if (PR.AsRegClass() == FEXCore::IR::RegClass::FPRFixed && PR.Reg < 16) {
@@ -787,6 +787,39 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
     } else {
       OS << "  store <2 x i64> " << VecVal << ", ptr %tmp_fpr_" << (unsigned(PR.Reg) & 15) << ", align 16\n";
     }
+  };
+
+  auto StoreFPRWrapper = [&](FEXCore::IR::OrderedNodeWrapper W, const std::string& VecVal) {
+    if (!UsesFPR || W.IsInvalid()) return;
+    if (W.IsImmediate()) {
+      FEXCore::IR::PhysicalRegister PR(W);
+      if (PR.IsInvalid()) return;
+      if (PR.AsRegClass() == FEXCore::IR::RegClass::FPRFixed && PR.Reg < 16) {
+        OS << "  store <2 x i64> " << VecVal << ", ptr %sra_fpr_" << unsigned(PR.Reg) << ", align 16\n";
+      } else {
+        OS << "  store <2 x i64> " << VecVal << ", ptr %tmp_fpr_" << (unsigned(PR.Reg) & 15) << ", align 16\n";
+      }
+    } else if (W.IsPointer()) {
+      StoreFPRDest(IR.GetNode(W), VecVal);
+    }
+  };
+
+  auto ZeroUpperFPRBits = [&](const std::string& VecVal, unsigned KeepBits) -> std::string {
+    if (KeepBits >= 128) return VecVal;
+    if (KeepBits == 64) {
+      std::string Z = NextVal();
+      OS << "  " << Z << " = insertelement <2 x i64> " << VecVal << ", i64 0, i32 1\n";
+      return Z;
+    }
+    if (KeepBits == 32 || KeepBits == 16 || KeepBits == 8) {
+      uint64_t Mask = (1ULL << KeepBits) - 1ULL;
+      std::string E0 = NextVal(), M0 = NextVal(), Z = NextVal();
+      OS << "  " << E0 << " = extractelement <2 x i64> " << VecVal << ", i32 0\n";
+      OS << "  " << M0 << " = and i64 " << E0 << ", " << Mask << "\n";
+      OS << "  " << Z << " = insertelement <2 x i64> zeroinitializer, i64 " << M0 << ", i32 0\n";
+      return Z;
+    }
+    return VecVal;
   };
 
   auto MaskToOpSize = [&](const std::string& Val64, FEXCore::IR::OpSize Size) -> std::string {
@@ -1138,9 +1171,21 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
           }
           StoreGPRDest(CodeNode, V);
         } else if (UsesFPR) {
-          std::string V = NextVal();
-          OS << "  " << V << " = load <2 x i64>, ptr " << Ptr << ", align 1\n";
-          StoreFPRDest(CodeNode, V);
+          if (Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64) {
+            std::string V = NextVal(), Z = NextVal(), Vec = NextVal();
+            OS << "  " << V << " = load i" << Bits << ", ptr " << Ptr << ", align 1\n";
+            if (Bits < 64) {
+              OS << "  " << Z << " = zext i" << Bits << " " << V << " to i64\n";
+            } else {
+              Z = V;
+            }
+            OS << "  " << Vec << " = insertelement <2 x i64> zeroinitializer, i64 " << Z << ", i32 0\n";
+            StoreFPRDest(CodeNode, Vec);
+          } else {
+            std::string V = NextVal();
+            OS << "  " << V << " = load <2 x i64>, ptr " << Ptr << ", align 1\n";
+            StoreFPRDest(CodeNode, V);
+          }
         }
         break;
       }
@@ -1162,7 +1207,18 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
           }
         } else if (UsesFPR) {
           std::string V = LoadFPROperand(Op->Value);
-          OS << "  store <2 x i64> " << V << ", ptr " << Ptr << ", align 1\n";
+          if (Bits == 8 || Bits == 16 || Bits == 32) {
+            std::string E0 = NextVal(), Tr = NextVal();
+            OS << "  " << E0 << " = extractelement <2 x i64> " << V << ", i32 0\n";
+            OS << "  " << Tr << " = trunc i64 " << E0 << " to i" << Bits << "\n";
+            OS << "  store i" << Bits << " " << Tr << ", ptr " << Ptr << ", align 1\n";
+          } else if (Bits == 64) {
+            std::string E0 = NextVal();
+            OS << "  " << E0 << " = extractelement <2 x i64> " << V << ", i32 0\n";
+            OS << "  store i64 " << E0 << ", ptr " << Ptr << ", align 1\n";
+          } else {
+            OS << "  store <2 x i64> " << V << ", ptr " << Ptr << ", align 1\n";
+          }
         }
         break;
       }
@@ -1189,11 +1245,11 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
           }
           StoreGPRDest(CodeNode, V);
         } else if (UsesFPR) {
-          if (Bits == 32 || Bits == 64) {
+          if (Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64) {
             std::string V = NextVal(), Z = NextVal(), Vec = NextVal();
             OS << "  " << V << " = load i" << Bits << ", ptr " << Ptr << ", align 1\n";
             if (Bits < 64) {
-              OS << "  " << Z << " = zext i32 " << V << " to i64\n";
+              OS << "  " << Z << " = zext i" << Bits << " " << V << " to i64\n";
             } else {
               Z = V;
             }
@@ -1226,11 +1282,11 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
           }
         } else if (UsesFPR) {
           std::string Vec = LoadFPROperand(Op->Value);
-          if (Bits == 32) {
+          if (Bits == 8 || Bits == 16 || Bits == 32) {
             std::string E0 = NextVal(), Tr = NextVal();
             OS << "  " << E0 << " = extractelement <2 x i64> " << Vec << ", i32 0\n";
-            OS << "  " << Tr << " = trunc i64 " << E0 << " to i32\n";
-            OS << "  store i32 " << Tr << ", ptr " << Ptr << ", align 1\n";
+            OS << "  " << Tr << " = trunc i64 " << E0 << " to i" << Bits << "\n";
+            OS << "  store i" << Bits << " " << Tr << ", ptr " << Ptr << ", align 1\n";
           } else if (Bits == 64) {
             std::string E0 = NextVal();
             OS << "  " << E0 << " = extractelement <2 x i64> " << Vec << ", i32 0\n";
@@ -1953,15 +2009,46 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         auto* Op = IROp->C<FEXCore::IR::IROp_LoadContextPair>();
         unsigned ElemBytes = OpSizeToBits(OpSize) / 8;
         if (ElemBytes == 0) ElemBytes = 8;
-        std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal(), V1 = NextVal(), V2 = NextVal();
+        std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal();
         OS << "  " << Addr1 << " = add i64 %state_ptr_int, " << Op->Offset << "\n";
         OS << "  " << Addr2 << " = add i64 %state_ptr_int, " << (Op->Offset + ElemBytes) << "\n";
         OS << "  " << Ptr1 << " = inttoptr i64 " << Addr1 << " to ptr\n";
         OS << "  " << Ptr2 << " = inttoptr i64 " << Addr2 << " to ptr\n";
-        OS << "  " << V1 << " = load i64, ptr " << Ptr1 << ", align 1\n";
-        OS << "  " << V2 << " = load i64, ptr " << Ptr2 << ", align 1\n";
-        StoreGPRWrapper(Op->OutValue1, MaskToOpSize(V1, OpSize));
-        StoreGPRWrapper(Op->OutValue2, MaskToOpSize(V2, OpSize));
+        if (Op->Class == FEXCore::IR::RegClass::GPR) {
+          unsigned LoadBits = (Bits == 32) ? 32 : 64;
+          std::string V1 = NextVal(), V2 = NextVal();
+          OS << "  " << V1 << " = load i" << LoadBits << ", ptr " << Ptr1 << ", align 1\n";
+          OS << "  " << V2 << " = load i" << LoadBits << ", ptr " << Ptr2 << ", align 1\n";
+          if (LoadBits < 64) {
+            std::string Z1 = NextVal(), Z2 = NextVal();
+            OS << "  " << Z1 << " = zext i32 " << V1 << " to i64\n";
+            OS << "  " << Z2 << " = zext i32 " << V2 << " to i64\n";
+            V1 = Z1; V2 = Z2;
+          }
+          StoreGPRWrapper(Op->OutValue1, V1);
+          StoreGPRWrapper(Op->OutValue2, V2);
+        } else if (UsesFPR) {
+          if (Bits == 32 || Bits == 64) {
+            std::string V1 = NextVal(), V2 = NextVal(), Z1 = V1, Z2 = V2, Vec1 = NextVal(), Vec2 = NextVal();
+            OS << "  " << V1 << " = load i" << Bits << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  " << V2 << " = load i" << Bits << ", ptr " << Ptr2 << ", align 1\n";
+            if (Bits < 64) {
+              Z1 = NextVal(); Z2 = NextVal();
+              OS << "  " << Z1 << " = zext i32 " << V1 << " to i64\n";
+              OS << "  " << Z2 << " = zext i32 " << V2 << " to i64\n";
+            }
+            OS << "  " << Vec1 << " = insertelement <2 x i64> zeroinitializer, i64 " << Z1 << ", i32 0\n";
+            OS << "  " << Vec2 << " = insertelement <2 x i64> zeroinitializer, i64 " << Z2 << ", i32 0\n";
+            StoreFPRWrapper(Op->OutValue1, Vec1);
+            StoreFPRWrapper(Op->OutValue2, Vec2);
+          } else {
+            std::string Vec1 = NextVal(), Vec2 = NextVal();
+            OS << "  " << Vec1 << " = load <2 x i64>, ptr " << Ptr1 << ", align 1\n";
+            OS << "  " << Vec2 << " = load <2 x i64>, ptr " << Ptr2 << ", align 1\n";
+            StoreFPRWrapper(Op->OutValue1, Vec1);
+            StoreFPRWrapper(Op->OutValue2, Vec2);
+          }
+        }
         break;
       }
 
@@ -1969,15 +2056,46 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         auto* Op = IROp->C<FEXCore::IR::IROp_StoreContextPair>();
         unsigned ElemBytes = OpSizeToBits(OpSize) / 8;
         if (ElemBytes == 0) ElemBytes = 8;
-        std::string V1 = LoadGPROperand(Op->Value1);
-        std::string V2 = LoadGPROperand(Op->Value2);
         std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal();
         OS << "  " << Addr1 << " = add i64 %state_ptr_int, " << Op->Offset << "\n";
         OS << "  " << Addr2 << " = add i64 %state_ptr_int, " << (Op->Offset + ElemBytes) << "\n";
         OS << "  " << Ptr1 << " = inttoptr i64 " << Addr1 << " to ptr\n";
         OS << "  " << Ptr2 << " = inttoptr i64 " << Addr2 << " to ptr\n";
-        OS << "  store i64 " << V1 << ", ptr " << Ptr1 << ", align 1\n";
-        OS << "  store i64 " << V2 << ", ptr " << Ptr2 << ", align 1\n";
+        if (Op->Class == FEXCore::IR::RegClass::GPR) {
+          std::string V1 = LoadGPROperand(Op->Value1);
+          std::string V2 = LoadGPROperand(Op->Value2);
+          if (Bits == 32) {
+            std::string T1 = NextVal(), T2 = NextVal();
+            OS << "  " << T1 << " = trunc i64 " << V1 << " to i32\n";
+            OS << "  " << T2 << " = trunc i64 " << V2 << " to i32\n";
+            OS << "  store i32 " << T1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i32 " << T2 << ", ptr " << Ptr2 << ", align 1\n";
+          } else {
+            OS << "  store i64 " << V1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i64 " << V2 << ", ptr " << Ptr2 << ", align 1\n";
+          }
+        } else if (UsesFPR) {
+          std::string Vec1 = LoadFPROperand(Op->Value1);
+          std::string Vec2 = LoadFPROperand(Op->Value2);
+          if (Bits == 32) {
+            std::string E1 = NextVal(), E2 = NextVal(), T1 = NextVal(), T2 = NextVal();
+            OS << "  " << E1 << " = extractelement <2 x i64> " << Vec1 << ", i32 0\n";
+            OS << "  " << E2 << " = extractelement <2 x i64> " << Vec2 << ", i32 0\n";
+            OS << "  " << T1 << " = trunc i64 " << E1 << " to i32\n";
+            OS << "  " << T2 << " = trunc i64 " << E2 << " to i32\n";
+            OS << "  store i32 " << T1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i32 " << T2 << ", ptr " << Ptr2 << ", align 1\n";
+          } else if (Bits == 64) {
+            std::string E1 = NextVal(), E2 = NextVal();
+            OS << "  " << E1 << " = extractelement <2 x i64> " << Vec1 << ", i32 0\n";
+            OS << "  " << E2 << " = extractelement <2 x i64> " << Vec2 << ", i32 0\n";
+            OS << "  store i64 " << E1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i64 " << E2 << ", ptr " << Ptr2 << ", align 1\n";
+          } else {
+            OS << "  store <2 x i64> " << Vec1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store <2 x i64> " << Vec2 << ", ptr " << Ptr2 << ", align 1\n";
+          }
+        }
         break;
       }
 
@@ -1986,15 +2104,46 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         unsigned ElemBytes = OpSizeToBits(OpSize) / 8;
         if (ElemBytes == 0) ElemBytes = 8;
         std::string Base = LoadGPROperand(Op->Addr);
-        std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal(), V1 = NextVal(), V2 = NextVal();
+        std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal();
         OS << "  " << Addr1 << " = add i64 " << Base << ", " << static_cast<int64_t>(Op->Offset) << "\n";
         OS << "  " << Addr2 << " = add i64 " << Addr1 << ", " << ElemBytes << "\n";
         OS << "  " << Ptr1 << " = inttoptr i64 " << Addr1 << " to ptr\n";
         OS << "  " << Ptr2 << " = inttoptr i64 " << Addr2 << " to ptr\n";
-        OS << "  " << V1 << " = load i64, ptr " << Ptr1 << ", align 1\n";
-        OS << "  " << V2 << " = load i64, ptr " << Ptr2 << ", align 1\n";
-        StoreGPRWrapper(Op->OutValue1, MaskToOpSize(V1, OpSize));
-        StoreGPRWrapper(Op->OutValue2, MaskToOpSize(V2, OpSize));
+        if (Op->Class == FEXCore::IR::RegClass::GPR) {
+          unsigned LoadBits = (Bits == 32) ? 32 : 64;
+          std::string V1 = NextVal(), V2 = NextVal();
+          OS << "  " << V1 << " = load i" << LoadBits << ", ptr " << Ptr1 << ", align 1\n";
+          OS << "  " << V2 << " = load i" << LoadBits << ", ptr " << Ptr2 << ", align 1\n";
+          if (LoadBits < 64) {
+            std::string Z1 = NextVal(), Z2 = NextVal();
+            OS << "  " << Z1 << " = zext i32 " << V1 << " to i64\n";
+            OS << "  " << Z2 << " = zext i32 " << V2 << " to i64\n";
+            V1 = Z1; V2 = Z2;
+          }
+          StoreGPRWrapper(Op->OutValue1, V1);
+          StoreGPRWrapper(Op->OutValue2, V2);
+        } else if (UsesFPR) {
+          if (Bits == 32 || Bits == 64) {
+            std::string V1 = NextVal(), V2 = NextVal(), Z1 = V1, Z2 = V2, Vec1 = NextVal(), Vec2 = NextVal();
+            OS << "  " << V1 << " = load i" << Bits << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  " << V2 << " = load i" << Bits << ", ptr " << Ptr2 << ", align 1\n";
+            if (Bits < 64) {
+              Z1 = NextVal(); Z2 = NextVal();
+              OS << "  " << Z1 << " = zext i32 " << V1 << " to i64\n";
+              OS << "  " << Z2 << " = zext i32 " << V2 << " to i64\n";
+            }
+            OS << "  " << Vec1 << " = insertelement <2 x i64> zeroinitializer, i64 " << Z1 << ", i32 0\n";
+            OS << "  " << Vec2 << " = insertelement <2 x i64> zeroinitializer, i64 " << Z2 << ", i32 0\n";
+            StoreFPRWrapper(Op->OutValue1, Vec1);
+            StoreFPRWrapper(Op->OutValue2, Vec2);
+          } else {
+            std::string Vec1 = NextVal(), Vec2 = NextVal();
+            OS << "  " << Vec1 << " = load <2 x i64>, ptr " << Ptr1 << ", align 1\n";
+            OS << "  " << Vec2 << " = load <2 x i64>, ptr " << Ptr2 << ", align 1\n";
+            StoreFPRWrapper(Op->OutValue1, Vec1);
+            StoreFPRWrapper(Op->OutValue2, Vec2);
+          }
+        }
         break;
       }
 
@@ -2003,15 +2152,46 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         unsigned ElemBytes = OpSizeToBits(OpSize) / 8;
         if (ElemBytes == 0) ElemBytes = 8;
         std::string Base = LoadGPROperand(Op->Addr);
-        std::string V1 = LoadGPROperand(Op->Value1);
-        std::string V2 = LoadGPROperand(Op->Value2);
         std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal();
         OS << "  " << Addr1 << " = add i64 " << Base << ", " << static_cast<int64_t>(Op->Offset) << "\n";
         OS << "  " << Addr2 << " = add i64 " << Addr1 << ", " << ElemBytes << "\n";
         OS << "  " << Ptr1 << " = inttoptr i64 " << Addr1 << " to ptr\n";
         OS << "  " << Ptr2 << " = inttoptr i64 " << Addr2 << " to ptr\n";
-        OS << "  store i64 " << V1 << ", ptr " << Ptr1 << ", align 1\n";
-        OS << "  store i64 " << V2 << ", ptr " << Ptr2 << ", align 1\n";
+        if (Op->Class == FEXCore::IR::RegClass::GPR) {
+          std::string V1 = LoadGPROperand(Op->Value1);
+          std::string V2 = LoadGPROperand(Op->Value2);
+          if (Bits == 32) {
+            std::string T1 = NextVal(), T2 = NextVal();
+            OS << "  " << T1 << " = trunc i64 " << V1 << " to i32\n";
+            OS << "  " << T2 << " = trunc i64 " << V2 << " to i32\n";
+            OS << "  store i32 " << T1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i32 " << T2 << ", ptr " << Ptr2 << ", align 1\n";
+          } else {
+            OS << "  store i64 " << V1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i64 " << V2 << ", ptr " << Ptr2 << ", align 1\n";
+          }
+        } else if (UsesFPR) {
+          std::string Vec1 = LoadFPROperand(Op->Value1);
+          std::string Vec2 = LoadFPROperand(Op->Value2);
+          if (Bits == 32) {
+            std::string E1 = NextVal(), E2 = NextVal(), T1 = NextVal(), T2 = NextVal();
+            OS << "  " << E1 << " = extractelement <2 x i64> " << Vec1 << ", i32 0\n";
+            OS << "  " << E2 << " = extractelement <2 x i64> " << Vec2 << ", i32 0\n";
+            OS << "  " << T1 << " = trunc i64 " << E1 << " to i32\n";
+            OS << "  " << T2 << " = trunc i64 " << E2 << " to i32\n";
+            OS << "  store i32 " << T1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i32 " << T2 << ", ptr " << Ptr2 << ", align 1\n";
+          } else if (Bits == 64) {
+            std::string E1 = NextVal(), E2 = NextVal();
+            OS << "  " << E1 << " = extractelement <2 x i64> " << Vec1 << ", i32 0\n";
+            OS << "  " << E2 << " = extractelement <2 x i64> " << Vec2 << ", i32 0\n";
+            OS << "  store i64 " << E1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store i64 " << E2 << ", ptr " << Ptr2 << ", align 1\n";
+          } else {
+            OS << "  store <2 x i64> " << Vec1 << ", ptr " << Ptr1 << ", align 1\n";
+            OS << "  store <2 x i64> " << Vec2 << ", ptr " << Ptr2 << ", align 1\n";
+          }
+        }
         break;
       }
 
@@ -2142,7 +2322,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       // Vector / NEON operations
       case FEXCore::IR::OP_VMOV: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VMov>();
-        StoreFPRDest(CodeNode, LoadFPROperand(Op->Source));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(LoadFPROperand(Op->Source), Bits));
         break;
       }
 
@@ -2274,7 +2454,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string V2 = LoadFPROperand(Op->Vector2);
         std::string R = NextVal();
         OS << "  " << R << " = and <2 x i64> " << V1 << ", " << V2 << "\n";
-        StoreFPRDest(CodeNode, R);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(R, Bits));
         break;
       }
 
@@ -2284,7 +2464,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string V2 = LoadFPROperand(Op->Vector2);
         std::string R = NextVal();
         OS << "  " << R << " = or <2 x i64> " << V1 << ", " << V2 << "\n";
-        StoreFPRDest(CodeNode, R);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(R, Bits));
         break;
       }
 
@@ -2294,18 +2474,20 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string V2 = LoadFPROperand(Op->Vector2);
         std::string R = NextVal();
         OS << "  " << R << " = xor <2 x i64> " << V1 << ", " << V2 << "\n";
-        StoreFPRDest(CodeNode, R);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(R, Bits));
         break;
       }
 
-      case FEXCore::IR::OP_VANDN: {
+      case FEXCore::IR::OP_VANDN:
+      case FEXCore::IR::OP_VORN: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VAndn>();
         std::string V1 = LoadFPROperand(Op->Vector1);
         std::string V2 = LoadFPROperand(Op->Vector2);
         std::string NotV2 = NextVal(), R = NextVal();
         OS << "  " << NotV2 << " = xor <2 x i64> " << V2 << ", <i64 -1, i64 -1>\n";
-        OS << "  " << R << " = and <2 x i64> " << V1 << ", " << NotV2 << "\n";
-        StoreFPRDest(CodeNode, R);
+        const char* LogicOp = (IROp->Op == FEXCore::IR::OP_VANDN) ? "and" : "or";
+        OS << "  " << R << " = " << LogicOp << " <2 x i64> " << V1 << ", " << NotV2 << "\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(R, Bits));
         break;
       }
 
@@ -2314,22 +2496,21 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         std::string V1 = LoadFPROperand(Op->Vector);
         std::string R = NextVal();
         OS << "  " << R << " = xor <2 x i64> " << V1 << ", <i64 -1, i64 -1>\n";
-        StoreFPRDest(CodeNode, R);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(R, Bits));
         break;
       }
 
       case FEXCore::IR::OP_VADD:
       case FEXCore::IR::OP_VSUB: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VAdd>();
-        std::string V1 = LoadFPROperand(Op->Vector1);
-        std::string V2 = LoadFPROperand(Op->Vector2);
-        std::string BC1 = NextVal(), BC2 = NextVal(), OpR = NextVal(), Res = NextVal();
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
         const char* IntOp = (IROp->Op == FEXCore::IR::OP_VADD) ? "add" : "sub";
-        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x i32>\n";
-        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <4 x i32>\n";
-        OS << "  " << OpR << " = " << IntOp << " <4 x i32> " << BC1 << ", " << BC2 << "\n";
-        OS << "  " << Res << " = bitcast <4 x i32> " << OpR << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        std::string Res = Rellume.LiftSseBinOp(LoadFPROperand(Op->Vector1),
+                                               LoadFPROperand(Op->Vector2),
+                                               IntOp, false,
+                                               rellume::x86_64::ResolveVecIntFacet(ElemBits));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2337,25 +2518,134 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_VFSUB:
       case FEXCore::IR::OP_VFMUL: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VFAdd>();
-        std::string V1 = LoadFPROperand(Op->Vector1);
-        std::string V2 = LoadFPROperand(Op->Vector2);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
         const char* FpOp = (IROp->Op == FEXCore::IR::OP_VFADD) ? "fadd" :
                            (IROp->Op == FEXCore::IR::OP_VFSUB) ? "fsub" : "fmul";
-        std::string BC1 = NextVal(), BC2 = NextVal(), OpR = NextVal(), Res = NextVal();
-        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x float>\n";
-        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <4 x float>\n";
-        OS << "  " << OpR << " = " << FpOp << " <4 x float> " << BC1 << ", " << BC2 << "\n";
-        OS << "  " << Res << " = bitcast <4 x float> " << OpR << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        std::string Res = Rellume.LiftSseBinOp(LoadFPROperand(Op->Vector1),
+                                               LoadFPROperand(Op->Vector2),
+                                               FpOp, false,
+                                               rellume::x86_64::ResolveVecFloatFacet(ElemBits));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
       case FEXCore::IR::OP_VCASTFROMGPR: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VCastFromGPR>();
-        std::string G = LoadGPROperand(Op->Src);
+        std::string G = MaskToOpSize(LoadGPROperand(Op->Src), IROp->ElementSize);
         std::string R = NextVal();
         OS << "  " << R << " = insertelement <2 x i64> zeroinitializer, i64 " << G << ", i32 0\n";
         StoreFPRDest(CodeNode, R);
+        break;
+      }
+
+      case FEXCore::IR::OP_VLOADTWOGPRS: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VLoadTwoGPRs>();
+        std::string Lo = LoadGPROperand(Op->Lower);
+        std::string Hi = LoadGPROperand(Op->Upper);
+        std::string R0 = NextVal(), R1 = NextVal();
+        OS << "  " << R0 << " = insertelement <2 x i64> zeroinitializer, i64 " << Lo << ", i32 0\n";
+        OS << "  " << R1 << " = insertelement <2 x i64> " << R0 << ", i64 " << Hi << ", i32 1\n";
+        StoreFPRDest(CodeNode, R1);
+        break;
+      }
+
+      case FEXCore::IR::OP_VDUPFROMGPR: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VDupFromGPR>();
+        std::string G = LoadGPROperand(Op->Src);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        unsigned Lanes = 128 / ElemBits;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string GTr = G;
+        if (ElemBits < 64) {
+          GTr = NextVal();
+          OS << "  " << GTr << " = trunc i64 " << G << " to i" << ElemBits << "\n";
+        }
+        std::string Ins0 = NextVal(), Shuf = NextVal(), Res = NextVal();
+        OS << "  " << Ins0 << " = insertelement " << VecTy << " poison, i" << ElemBits << " " << GTr << ", i32 0\n";
+        OS << "  " << Shuf << " = shufflevector " << VecTy << " " << Ins0 << ", " << VecTy << " poison, <" << Lanes << " x i32> zeroinitializer\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Shuf << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_FLOAT_FROMGPR_S: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Float_FromGPR_S>();
+        std::string G = LoadGPROperand(Op->Src);
+        unsigned DstBits = OpSizeToBits(IROp->ElementSize);
+        unsigned SrcBits = OpSizeToBits(Op->SrcElementSize);
+        std::string GVal = G;
+        if (SrcBits == 32) {
+          GVal = NextVal();
+          OS << "  " << GVal << " = trunc i64 " << G << " to i32\n";
+        } else {
+          SrcBits = 64;
+        }
+        if (DstBits == 64) {
+          std::string Fp = NextVal(), Ins = NextVal(), Res = NextVal();
+          OS << "  " << Fp << " = sitofp i" << SrcBits << " " << GVal << " to double\n";
+          OS << "  " << Ins << " = insertelement <2 x double> zeroinitializer, double " << Fp << ", i32 0\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Ins << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, Res);
+        } else {
+          std::string Fp = NextVal(), Ins = NextVal(), Res = NextVal();
+          OS << "  " << Fp << " = sitofp i" << SrcBits << " " << GVal << " to float\n";
+          OS << "  " << Ins << " = insertelement <4 x float> zeroinitializer, float " << Fp << ", i32 0\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Ins << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, Res);
+        }
+        break;
+      }
+
+      case FEXCore::IR::OP_FLOAT_FTOF: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Float_FToF>();
+        std::string V = LoadFPROperand(Op->Scalar);
+        unsigned DstBits = OpSizeToBits(IROp->ElementSize);
+        unsigned SrcBits = OpSizeToBits(Op->SrcElementSize);
+        if (DstBits == 64 && SrcBits == 32) {
+          std::string BC = NextVal(), E = NextVal(), Cvt = NextVal(), Ins = NextVal(), Res = NextVal();
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
+          OS << "  " << E << " = extractelement <4 x float> " << BC << ", i32 0\n";
+          OS << "  " << Cvt << " = fpext float " << E << " to double\n";
+          OS << "  " << Ins << " = insertelement <2 x double> zeroinitializer, double " << Cvt << ", i32 0\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Ins << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, Res);
+        } else if (DstBits == 32 && SrcBits == 64) {
+          std::string BC = NextVal(), E = NextVal(), Cvt = NextVal(), Ins = NextVal(), Res = NextVal();
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <2 x double>\n";
+          OS << "  " << E << " = extractelement <2 x double> " << BC << ", i32 0\n";
+          OS << "  " << Cvt << " = fptrunc double " << E << " to float\n";
+          OS << "  " << Ins << " = insertelement <4 x float> zeroinitializer, float " << Cvt << ", i32 0\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Ins << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, Res);
+        } else {
+          StoreFPRDest(CodeNode, ZeroUpperFPRBits(V, DstBits));
+        }
+        break;
+      }
+
+      case FEXCore::IR::OP_VECTORIMM: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VectorImm>();
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 8;
+        uint64_t Val64 = 0;
+        if (Op->Do64BitExpansion) {
+          for (size_t i = 0; i < 8; ++i) {
+            if ((Op->Immediate >> i) & 1) {
+              Val64 |= (0xFFULL << (i * 8));
+            }
+          }
+        } else {
+          uint64_t ElemVal = (static_cast<uint64_t>(Op->Immediate) << Op->ShiftAmount);
+          if (ElemBits < 64) ElemVal &= ((1ULL << ElemBits) - 1ULL);
+          for (unsigned b = 0; b < 64; b += ElemBits) {
+            Val64 |= (ElemVal << b);
+          }
+        }
+        uint64_t Hi64 = (Bits <= 64) ? 0ULL : Val64;
+        std::string VecLit = "<i64 " + std::to_string(static_cast<int64_t>(Val64)) +
+                             ", i64 " + std::to_string(static_cast<int64_t>(Hi64)) + ">";
+        StoreFPRDest(CodeNode, VecLit);
         break;
       }
 
@@ -2375,35 +2665,51 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
           OS << "  " << Z << " = zext i" << ElemBits << " " << Ext << " to i64\n";
           Ext = Z;
         }
-        StoreGPRDest(CodeNode, Ext);
+        StoreGPRDest(CodeNode, MaskToOpSize(Ext, OpSize));
         break;
       }
 
       case FEXCore::IR::OP_VCMPGT:
+      case FEXCore::IR::OP_VUCMPGT:
       case FEXCore::IR::OP_VCMPEQ: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VCMPGT>();
         std::string V1 = LoadFPROperand(Op->Vector1);
         std::string V2 = LoadFPROperand(Op->Vector2);
-        const char* Pred = (IROp->Op == FEXCore::IR::OP_VCMPGT) ? "sgt" : "eq";
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        unsigned Lanes = 128 / ElemBits;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string BoolTy = "<" + std::to_string(Lanes) + " x i1>";
+        const char* Pred = (IROp->Op == FEXCore::IR::OP_VCMPGT) ? "sgt" :
+                           (IROp->Op == FEXCore::IR::OP_VUCMPGT) ? "ugt" : "eq";
         std::string BC1 = NextVal(), BC2 = NextVal(), Cmp = NextVal(), Ext = NextVal(), Res = NextVal();
-        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x i32>\n";
-        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <4 x i32>\n";
-        OS << "  " << Cmp << " = icmp " << Pred << " <4 x i32> " << BC1 << ", " << BC2 << "\n";
-        OS << "  " << Ext << " = sext <4 x i1> " << Cmp << " to <4 x i32>\n";
-        OS << "  " << Res << " = bitcast <4 x i32> " << Ext << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to " << VecTy << "\n";
+        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to " << VecTy << "\n";
+        OS << "  " << Cmp << " = icmp " << Pred << " " << VecTy << " " << BC1 << ", " << BC2 << "\n";
+        OS << "  " << Ext << " = sext " << BoolTy << " " << Cmp << " to " << VecTy << "\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Ext << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
-      case FEXCore::IR::OP_VCMPLTZ: {
+      case FEXCore::IR::OP_VCMPLTZ:
+      case FEXCore::IR::OP_VCMPEQZ:
+      case FEXCore::IR::OP_VCMPGTZ: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VCMPLTZ>();
         std::string V1 = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        unsigned Lanes = 128 / ElemBits;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string BoolTy = "<" + std::to_string(Lanes) + " x i1>";
+        const char* Pred = (IROp->Op == FEXCore::IR::OP_VCMPLTZ) ? "slt" :
+                           (IROp->Op == FEXCore::IR::OP_VCMPEQZ) ? "eq" : "sgt";
         std::string BC1 = NextVal(), Cmp = NextVal(), Ext = NextVal(), Res = NextVal();
-        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x i32>\n";
-        OS << "  " << Cmp << " = icmp slt <4 x i32> " << BC1 << ", zeroinitializer\n";
-        OS << "  " << Ext << " = sext <4 x i1> " << Cmp << " to <4 x i32>\n";
-        OS << "  " << Res << " = bitcast <4 x i32> " << Ext << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to " << VecTy << "\n";
+        OS << "  " << Cmp << " = icmp " << Pred << " " << VecTy << " " << BC1 << ", zeroinitializer\n";
+        OS << "  " << Ext << " = sext " << BoolTy << " " << Cmp << " to " << VecTy << "\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Ext << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2411,33 +2717,49 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_VSHLI: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VUShrI>();
         std::string V1 = LoadFPROperand(Op->Vector);
-        unsigned Sh = Op->BitShift & 31;
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        if (Op->BitShift >= ElemBits) {
+          StoreFPRDest(CodeNode, "zeroinitializer");
+          break;
+        }
+        unsigned Lanes = 128 / ElemBits;
+        unsigned Sh = Op->BitShift;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string ShVec = "<";
+        for (unsigned i = 0; i < Lanes; ++i) {
+          if (i > 0) ShVec += ", ";
+          ShVec += "i" + std::to_string(ElemBits) + " " + std::to_string(Sh);
+        }
+        ShVec += ">";
         const char* ShOp = (IROp->Op == FEXCore::IR::OP_VUSHRI) ? "lshr" : "shl";
         std::string BC1 = NextVal(), OpR = NextVal(), Res = NextVal();
-        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x i32>\n";
-        OS << "  " << OpR << " = " << ShOp << " <4 x i32> " << BC1 << ", <i32 " << Sh << ", i32 " << Sh << ", i32 " << Sh << ", i32 " << Sh << ">\n";
-        OS << "  " << Res << " = bitcast <4 x i32> " << OpR << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to " << VecTy << "\n";
+        OS << "  " << OpR << " = " << ShOp << " " << VecTy << " " << BC1 << ", " << ShVec << "\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << OpR << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
       case FEXCore::IR::OP_VADDP: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VAddP>();
         unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
-        StoreFPRDest(CodeNode, Rellume.LiftSseBinOp(LoadFPROperand(Op->VectorLower),
-                                                    LoadFPROperand(Op->VectorUpper),
-                                                    "add", true,
-                                                    rellume::x86_64::ResolveVecIntFacet(ElemBits)));
+        std::string Res = Rellume.LiftSseBinOp(LoadFPROperand(Op->VectorLower),
+                                               LoadFPROperand(Op->VectorUpper),
+                                               "add", true,
+                                               rellume::x86_64::ResolveVecIntFacet(ElemBits));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
       case FEXCore::IR::OP_VFADDP: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VFAddP>();
         unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
-        StoreFPRDest(CodeNode, Rellume.LiftSseBinOp(LoadFPROperand(Op->VectorLower),
-                                                    LoadFPROperand(Op->VectorUpper),
-                                                    "fadd", true,
-                                                    rellume::x86_64::ResolveVecFloatFacet(ElemBits)));
+        std::string Res = Rellume.LiftSseBinOp(LoadFPROperand(Op->VectorLower),
+                                               LoadFPROperand(Op->VectorUpper),
+                                               "fadd", true,
+                                               rellume::x86_64::ResolveVecFloatFacet(ElemBits));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2451,7 +2773,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         bool IsDeinterleave = (IROp->Op == FEXCore::IR::OP_VUNZIP || IROp->Op == FEXCore::IR::OP_VUNZIP2);
         StoreFPRDest(CodeNode, Rellume.LiftSseUnpck(LoadFPROperand(Op->VectorLower),
                                                     LoadFPROperand(Op->VectorUpper),
-                                                    ElemBits, HighHalf, IsDeinterleave));
+                                                    ElemBits, HighHalf, IsDeinterleave, Bits));
         break;
       }
 
@@ -2460,10 +2782,11 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         auto* Op = IROp->C<FEXCore::IR::IROp_VFMin>();
         unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
         const char* Pred = (IROp->Op == FEXCore::IR::OP_VFMIN) ? "olt" : "ogt";
-        StoreFPRDest(CodeNode, Rellume.LiftSseMinMax(LoadFPROperand(Op->Vector1),
-                                                     LoadFPROperand(Op->Vector2),
-                                                     "fcmp", Pred,
-                                                     rellume::x86_64::ResolveVecFloatFacet(ElemBits)));
+        std::string Res = Rellume.LiftSseMinMax(LoadFPROperand(Op->Vector1),
+                                                LoadFPROperand(Op->Vector2),
+                                                "fcmp", Pred,
+                                                rellume::x86_64::ResolveVecFloatFacet(ElemBits));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2476,22 +2799,25 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         const char* Pred = (IROp->Op == FEXCore::IR::OP_VSMIN) ? "slt" :
                            (IROp->Op == FEXCore::IR::OP_VSMAX) ? "sgt" :
                            (IROp->Op == FEXCore::IR::OP_VUMIN) ? "ult" : "ugt";
-        StoreFPRDest(CodeNode, Rellume.LiftSseMinMax(LoadFPROperand(Op->Vector1),
-                                                     LoadFPROperand(Op->Vector2),
-                                                     "icmp", Pred,
-                                                     rellume::x86_64::ResolveVecIntFacet(ElemBits)));
+        std::string Res = Rellume.LiftSseMinMax(LoadFPROperand(Op->Vector1),
+                                                LoadFPROperand(Op->Vector2),
+                                                "icmp", Pred,
+                                                rellume::x86_64::ResolveVecIntFacet(ElemBits));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
       case FEXCore::IR::OP_VFSQRT: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VFSqrt>();
-        StoreFPRDest(CodeNode, Rellume.LiftSseSqrt(LoadFPROperand(Op->Vector), OpSizeToBits(IROp->ElementSize)));
+        std::string Res = Rellume.LiftSseSqrt(LoadFPROperand(Op->Vector), OpSizeToBits(IROp->ElementSize));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
       case FEXCore::IR::OP_VABS: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VAbs>();
-        StoreFPRDest(CodeNode, Rellume.LiftSsePabs(LoadFPROperand(Op->Vector), OpSizeToBits(IROp->ElementSize)));
+        std::string Res = Rellume.LiftSsePabs(LoadFPROperand(Op->Vector), OpSizeToBits(IROp->ElementSize));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2499,9 +2825,10 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         auto* Op = IROp->C<FEXCore::IR::IROp_VExtr>();
         unsigned ElemBytes = OpSizeToBits(IROp->ElementSize) / 8;
         if (ElemBytes == 0) ElemBytes = 1;
+        unsigned OpBytes = (Bits == 64) ? 8 : 16;
         StoreFPRDest(CodeNode, Rellume.LiftSsePalignr(LoadFPROperand(Op->VectorUpper),
                                                       LoadFPROperand(Op->VectorLower),
-                                                      Op->Index * ElemBytes));
+                                                      Op->Index, ElemBytes, OpBytes));
         break;
       }
 
@@ -2583,18 +2910,55 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_VADDV: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VAddV>();
         std::string V = LoadFPROperand(Op->Vector);
-        std::string BC = NextVal(), E0 = NextVal(), E1 = NextVal(), E2 = NextVal(), E3 = NextVal(), S01 = NextVal(), S23 = NextVal(), Sum = NextVal(), Sum64 = NextVal(), Res = NextVal();
-        OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x i32>\n";
-        OS << "  " << E0 << " = extractelement <4 x i32> " << BC << ", i32 0\n";
-        OS << "  " << E1 << " = extractelement <4 x i32> " << BC << ", i32 1\n";
-        OS << "  " << E2 << " = extractelement <4 x i32> " << BC << ", i32 2\n";
-        OS << "  " << E3 << " = extractelement <4 x i32> " << BC << ", i32 3\n";
-        OS << "  " << S01 << " = add i32 " << E0 << ", " << E1 << "\n";
-        OS << "  " << S23 << " = add i32 " << E2 << ", " << E3 << "\n";
-        OS << "  " << Sum << " = add i32 " << S01 << ", " << S23 << "\n";
-        OS << "  " << Sum64 << " = zext i32 " << Sum << " to i64\n";
-        OS << "  " << Res << " = insertelement <2 x i64> zeroinitializer, i64 " << Sum64 << ", i32 0\n";
-        StoreFPRDest(CodeNode, Res);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits == 64) {
+          std::string E0 = NextVal(), E1 = NextVal(), Sum = NextVal(), Res = NextVal();
+          OS << "  " << E0 << " = extractelement <2 x i64> " << V << ", i32 0\n";
+          OS << "  " << E1 << " = extractelement <2 x i64> " << V << ", i32 1\n";
+          OS << "  " << Sum << " = add i64 " << E0 << ", " << E1 << "\n";
+          OS << "  " << Res << " = insertelement <2 x i64> zeroinitializer, i64 " << Sum << ", i32 0\n";
+          StoreFPRDest(CodeNode, Res);
+        } else {
+          if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32) ElemBits = 32;
+          unsigned Lanes = 128 / ElemBits;
+          std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+          std::string BC = NextVal(), Sum = NextVal(), Sum64 = NextVal(), Res = NextVal();
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to " << VecTy << "\n";
+          OS << "  " << Sum << " = call i" << ElemBits << " @llvm.vector.reduce.add.v" << Lanes << "i" << ElemBits << "(" << VecTy << " " << BC << ")\n";
+          OS << "  " << Sum64 << " = zext i" << ElemBits << " " << Sum << " to i64\n";
+          OS << "  " << Res << " = insertelement <2 x i64> zeroinitializer, i64 " << Sum64 << ", i32 0\n";
+          StoreFPRDest(CodeNode, Res);
+        }
+        break;
+      }
+
+      case FEXCore::IR::OP_VFADDV: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFAddV>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits == 64) {
+          std::string BC = NextVal(), E0 = NextVal(), E1 = NextVal(), Sum = NextVal(), Ins = NextVal(), Res = NextVal();
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <2 x double>\n";
+          OS << "  " << E0 << " = extractelement <2 x double> " << BC << ", i32 0\n";
+          OS << "  " << E1 << " = extractelement <2 x double> " << BC << ", i32 1\n";
+          OS << "  " << Sum << " = fadd double " << E0 << ", " << E1 << "\n";
+          OS << "  " << Ins << " = insertelement <2 x double> zeroinitializer, double " << Sum << ", i32 0\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Ins << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, Res);
+        } else {
+          std::string BC = NextVal(), E0 = NextVal(), E1 = NextVal(), E2 = NextVal(), E3 = NextVal(), S01 = NextVal(), S23 = NextVal(), Sum = NextVal(), Ins = NextVal(), Res = NextVal();
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
+          OS << "  " << E0 << " = extractelement <4 x float> " << BC << ", i32 0\n";
+          OS << "  " << E1 << " = extractelement <4 x float> " << BC << ", i32 1\n";
+          OS << "  " << E2 << " = extractelement <4 x float> " << BC << ", i32 2\n";
+          OS << "  " << E3 << " = extractelement <4 x float> " << BC << ", i32 3\n";
+          OS << "  " << S01 << " = fadd float " << E0 << ", " << E1 << "\n";
+          OS << "  " << S23 << " = fadd float " << E2 << ", " << E3 << "\n";
+          OS << "  " << Sum << " = fadd float " << S01 << ", " << S23 << "\n";
+          OS << "  " << Ins << " = insertelement <4 x float> zeroinitializer, float " << Sum << ", i32 0\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Ins << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, Res);
+        }
         break;
       }
 
@@ -2605,7 +2969,19 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
         OS << "  " << OpR << " = fdiv <4 x float> <float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>, " << BC << "\n";
         OS << "  " << Res << " = bitcast <4 x float> " << OpR << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFRSQRT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFRSqrt>();
+        std::string V = LoadFPROperand(Op->Vector);
+        std::string BC = NextVal(), Sq = NextVal(), OpR = NextVal(), Res = NextVal();
+        OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
+        OS << "  " << Sq << " = call <4 x float> @llvm.sqrt.v4f32(<4 x float> " << BC << ")\n";
+        OS << "  " << OpR << " = fdiv <4 x float> <float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>, " << Sq << "\n";
+        OS << "  " << Res << " = bitcast <4 x float> " << OpR << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2623,7 +2999,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << Ins0 << " = insertelement " << VecTy << " poison, i" << ElemBits << " " << E << ", i32 0\n";
         OS << "  " << Shuf << " = shufflevector " << VecTy << " " << Ins0 << ", " << VecTy << " poison, <" << Lanes << " x i32> zeroinitializer\n";
         OS << "  " << Res << " = bitcast " << VecTy << " " << Shuf << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2646,9 +3022,32 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         auto* Op = IROp->C<FEXCore::IR::IROp_VUShl>();
         const char* ShOp = (IROp->Op == FEXCore::IR::OP_VUSHL) ? "shl" :
                            (IROp->Op == FEXCore::IR::OP_VUSHR) ? "lshr" : "ashr";
-        StoreFPRDest(CodeNode, Rellume.LiftSsePshiftElement(LoadFPROperand(Op->Vector),
-                                                            LoadFPROperand(Op->ShiftVector),
-                                                            ShOp, OpSizeToBits(IROp->ElementSize)));
+        std::string Res = Rellume.LiftSsePshiftElement(LoadFPROperand(Op->Vector),
+                                                       LoadFPROperand(Op->ShiftVector),
+                                                       ShOp, OpSizeToBits(IROp->ElementSize));
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VUSHLS:
+      case FEXCore::IR::OP_VUSHRS:
+      case FEXCore::IR::OP_VSSHRS: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VUShlS>();
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        unsigned Lanes = 128 / ElemBits;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string ShS = LoadFPROperand(Op->ShiftScalar);
+        std::string BCS = NextVal(), E0 = NextVal(), Ins0 = NextVal(), Shuf = NextVal(), ShVec = NextVal();
+        OS << "  " << BCS << " = bitcast <2 x i64> " << ShS << " to " << VecTy << "\n";
+        OS << "  " << E0 << " = extractelement " << VecTy << " " << BCS << ", i32 0\n";
+        OS << "  " << Ins0 << " = insertelement " << VecTy << " poison, i" << ElemBits << " " << E0 << ", i32 0\n";
+        OS << "  " << Shuf << " = shufflevector " << VecTy << " " << Ins0 << ", " << VecTy << " poison, <" << Lanes << " x i32> zeroinitializer\n";
+        OS << "  " << ShVec << " = bitcast " << VecTy << " " << Shuf << " to <2 x i64>\n";
+        const char* ShOp = (IROp->Op == FEXCore::IR::OP_VUSHLS) ? "shl" :
+                           (IROp->Op == FEXCore::IR::OP_VUSHRS) ? "lshr" : "ashr";
+        std::string Res = Rellume.LiftSsePshiftElement(LoadFPROperand(Op->Vector), ShVec, ShOp, ElemBits);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -2656,21 +3055,35 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       case FEXCore::IR::OP_VFCMPNEQ:
       case FEXCore::IR::OP_VFCMPLT:
       case FEXCore::IR::OP_VFCMPGT:
-      case FEXCore::IR::OP_VFCMPLE: {
+      case FEXCore::IR::OP_VFCMPLE:
+      case FEXCore::IR::OP_VFCMPORD:
+      case FEXCore::IR::OP_VFCMPUNO: {
         auto* Op = IROp->C<FEXCore::IR::IROp_VFCMPLT>();
         std::string V1 = LoadFPROperand(Op->Vector1);
         std::string V2 = LoadFPROperand(Op->Vector2);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
         const char* Pred = (IROp->Op == FEXCore::IR::OP_VFCMPEQ) ? "oeq" :
                            (IROp->Op == FEXCore::IR::OP_VFCMPNEQ) ? "une" :
                            (IROp->Op == FEXCore::IR::OP_VFCMPLT) ? "olt" :
-                           (IROp->Op == FEXCore::IR::OP_VFCMPGT) ? "ogt" : "ole";
-        std::string BC1 = NextVal(), BC2 = NextVal(), Cmp = NextVal(), Ext = NextVal(), Res = NextVal();
-        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x float>\n";
-        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <4 x float>\n";
-        OS << "  " << Cmp << " = fcmp " << Pred << " <4 x float> " << BC1 << ", " << BC2 << "\n";
-        OS << "  " << Ext << " = sext <4 x i1> " << Cmp << " to <4 x i32>\n";
-        OS << "  " << Res << " = bitcast <4 x i32> " << Ext << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+                           (IROp->Op == FEXCore::IR::OP_VFCMPGT) ? "ogt" :
+                           (IROp->Op == FEXCore::IR::OP_VFCMPLE) ? "ole" :
+                           (IROp->Op == FEXCore::IR::OP_VFCMPORD) ? "ord" : "uno";
+        if (ElemBits == 64) {
+          std::string BC1 = NextVal(), BC2 = NextVal(), Cmp = NextVal(), Ext = NextVal();
+          OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <2 x double>\n";
+          OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <2 x double>\n";
+          OS << "  " << Cmp << " = fcmp " << Pred << " <2 x double> " << BC1 << ", " << BC2 << "\n";
+          OS << "  " << Ext << " = sext <2 x i1> " << Cmp << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, ZeroUpperFPRBits(Ext, Bits));
+        } else {
+          std::string BC1 = NextVal(), BC2 = NextVal(), Cmp = NextVal(), Ext = NextVal(), Res = NextVal();
+          OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x float>\n";
+          OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <4 x float>\n";
+          OS << "  " << Cmp << " = fcmp " << Pred << " <4 x float> " << BC1 << ", " << BC2 << "\n";
+          OS << "  " << Ext << " = sext <4 x i1> " << Cmp << " to <4 x i32>\n";
+          OS << "  " << Res << " = bitcast <4 x i32> " << Ext << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        }
         break;
       }
 
@@ -3390,7 +3803,18 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         const char* Arr = (ElemBits == 8) ? "16b" : (ElemBits == 16) ? "8h" : "4s";
         std::string Res = NextVal();
         OS << "  " << Res << " = call <2 x i64> asm \"rev64 $0." << Arr << ", $1." << Arr << "\", \"=w,w\"(<2 x i64> " << V1 << ")\n";
-        StoreFPRDest(CodeNode, Res);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VREV32: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VRev32>();
+        std::string V1 = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        const char* Arr = (ElemBits == 8) ? "16b" : "8h";
+        std::string Res = NextVal();
+        OS << "  " << Res << " = call <2 x i64> asm \"rev32 $0." << Arr << ", $1." << Arr << "\", \"=w,w\"(<2 x i64> " << V1 << ")\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -3404,7 +3828,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         const char* Arr = (ElemBits == 8) ? "16b" : (ElemBits == 16) ? "8h" : (ElemBits == 32) ? "4s" : "2d";
         std::string Res = NextVal();
         OS << "  " << Res << " = call <2 x i64> asm \"" << Mn << " $0." << Arr << ", $1." << Arr << ", $2." << Arr << "\", \"=w,w,w\"(<2 x i64> " << V1 << ", <2 x i64> " << V2 << ")\n";
-        StoreFPRDest(CodeNode, Res);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -3417,7 +3841,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << BCI << " = bitcast <2 x i64> " << VI << " to <16 x i8>\n";
         OS << "  " << Tbl << " = call <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8> " << BCT << ", <16 x i8> " << BCI << ")\n";
         OS << "  " << Res << " = bitcast <16 x i8> " << Tbl << " to <2 x i64>\n";
-        StoreFPRDest(CodeNode, Res);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -3432,7 +3856,578 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << BCI << " = bitcast <2 x i64> " << VI << " to <16 x i8>\n";
         OS << "  " << Tbl << " = call <16 x i8> @llvm.aarch64.neon.tbl2.v16i8(<16 x i8> " << BCT1 << ", <16 x i8> " << BCT2 << ", <16 x i8> " << BCI << ")\n";
         OS << "  " << Res << " = bitcast <16 x i8> " << Tbl << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VTBX1: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VTBX1>();
+        std::string VSD = LoadFPROperand(Op->VectorSrcDst);
+        std::string VT = LoadFPROperand(Op->VectorTable);
+        std::string VI = LoadFPROperand(Op->VectorIndices);
+        std::string BCSD = NextVal(), BCT = NextVal(), BCI = NextVal(), Tbx = NextVal(), Res = NextVal();
+        OS << "  " << BCSD << " = bitcast <2 x i64> " << VSD << " to <16 x i8>\n";
+        OS << "  " << BCT << " = bitcast <2 x i64> " << VT << " to <16 x i8>\n";
+        OS << "  " << BCI << " = bitcast <2 x i64> " << VI << " to <16 x i8>\n";
+        OS << "  " << Tbx << " = call <16 x i8> @llvm.aarch64.neon.tbx1.v16i8(<16 x i8> " << BCSD << ", <16 x i8> " << BCT << ", <16 x i8> " << BCI << ")\n";
+        OS << "  " << Res << " = bitcast <16 x i8> " << Tbx << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VBLENDIMM: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VBlendImm>();
+        std::string VL = LoadFPROperand(Op->LHS);
+        std::string VR = LoadFPROperand(Op->RHS);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        unsigned Lanes = 128 / ElemBits;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string MaskStr = "<";
+        for (unsigned i = 0; i < Lanes; ++i) {
+          if (i) MaskStr += ", ";
+          bool PickR = ((Op->Selector >> i) & 1) != 0;
+          MaskStr += "i32 " + std::to_string(PickR ? (Lanes + i) : i);
+        }
+        MaskStr += ">";
+        std::string BCL = NextVal(), BCR = NextVal(), Shuf = NextVal(), Res = NextVal();
+        OS << "  " << BCL << " = bitcast <2 x i64> " << VL << " to " << VecTy << "\n";
+        OS << "  " << BCR << " = bitcast <2 x i64> " << VR << " to " << VecTy << "\n";
+        OS << "  " << Shuf << " = shufflevector " << VecTy << " " << BCL << ", " << VecTy << " " << BCR << ", <" << Lanes << " x i32> " << MaskStr << "\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Shuf << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VNEG: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VNeg>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+        unsigned Lanes = 128 / ElemBits;
+        std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+        std::string BC = NextVal(), Neg = NextVal(), Res = NextVal();
+        OS << "  " << BC << " = bitcast <2 x i64> " << V << " to " << VecTy << "\n";
+        OS << "  " << Neg << " = sub " << VecTy << " zeroinitializer, " << BC << "\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Neg << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFNEG: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFNeg>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        std::string BC = NextVal(), Neg = NextVal(), Res = NextVal();
+        if (ElemBits == 64) {
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <2 x double>\n";
+          OS << "  " << Neg << " = fneg <2 x double> " << BC << "\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Neg << " to <2 x i64>\n";
+        } else {
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
+          OS << "  " << Neg << " = fneg <4 x float> " << BC << "\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Neg << " to <2 x i64>\n";
+        }
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFABS: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFAbs>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        std::string BC = NextVal(), Abs = NextVal(), Res = NextVal();
+        if (ElemBits == 64) {
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <2 x double>\n";
+          OS << "  " << Abs << " = call <2 x double> @llvm.fabs.v2f64(<2 x double> " << BC << ")\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Abs << " to <2 x i64>\n";
+        } else {
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
+          OS << "  " << Abs << " = call <4 x float> @llvm.fabs.v4f32(<4 x float> " << BC << ")\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Abs << " to <2 x i64>\n";
+        }
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VPOPCOUNT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VPopcount>();
+        std::string V = LoadFPROperand(Op->Vector);
+        std::string BC = NextVal(), Cnt = NextVal(), Res = NextVal();
+        OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <16 x i8>\n";
+        OS << "  " << Cnt << " = call <16 x i8> @llvm.ctpop.v16i8(<16 x i8> " << BC << ")\n";
+        OS << "  " << Res << " = bitcast <16 x i8> " << Cnt << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFCOPYSIGN: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFCopySign>();
+        std::string V1 = LoadFPROperand(Op->Vector1);
+        std::string V2 = LoadFPROperand(Op->Vector2);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        std::string BC1 = NextVal(), BC2 = NextVal(), Cs = NextVal(), Res = NextVal();
+        if (ElemBits == 64) {
+          OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <2 x double>\n";
+          OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <2 x double>\n";
+          OS << "  " << Cs << " = call <2 x double> @llvm.copysign.v2f64(<2 x double> " << BC1 << ", <2 x double> " << BC2 << ")\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Cs << " to <2 x i64>\n";
+        } else {
+          OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <4 x float>\n";
+          OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <4 x float>\n";
+          OS << "  " << Cs << " = call <4 x float> @llvm.copysign.v4f32(<4 x float> " << BC1 << ", <4 x float> " << BC2 << ")\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Cs << " to <2 x i64>\n";
+        }
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFMLA:
+      case FEXCore::IR::OP_VFMLS:
+      case FEXCore::IR::OP_VFNMLA:
+      case FEXCore::IR::OP_VFNMLS: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFMLA>();
+        std::string V1 = LoadFPROperand(Op->Vector1);
+        std::string V2 = LoadFPROperand(Op->Vector2);
+        std::string VA = LoadFPROperand(Op->Addend);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        bool NegProd = (IROp->Op == FEXCore::IR::OP_VFNMLA || IROp->Op == FEXCore::IR::OP_VFNMLS);
+        bool NegAdd  = (IROp->Op == FEXCore::IR::OP_VFMLS  || IROp->Op == FEXCore::IR::OP_VFNMLS);
+        const char* VecTy = (ElemBits == 64) ? "<2 x double>" : "<4 x float>";
+        const char* Intr  = (ElemBits == 64) ? "@llvm.fma.v2f64" : "@llvm.fma.v4f32";
+        std::string BC1 = NextVal(), BC2 = NextVal(), BCA = NextVal();
+        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to " << VecTy << "\n";
+        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to " << VecTy << "\n";
+        OS << "  " << BCA << " = bitcast <2 x i64> " << VA << " to " << VecTy << "\n";
+        if (NegProd) {
+          std::string N1 = NextVal();
+          OS << "  " << N1 << " = fneg " << VecTy << " " << BC1 << "\n";
+          BC1 = N1;
+        }
+        if (NegAdd) {
+          std::string NA = NextVal();
+          OS << "  " << NA << " = fneg " << VecTy << " " << BCA << "\n";
+          BCA = NA;
+        }
+        std::string Fma = NextVal(), Res = NextVal();
+        OS << "  " << Fma << " = call " << VecTy << " " << Intr << "(" << VecTy << " " << BC1 << ", " << VecTy << " " << BC2 << ", " << VecTy << " " << BCA << ")\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Fma << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFMLASCALARINSERT:
+      case FEXCore::IR::OP_VFMLSSCALARINSERT:
+      case FEXCore::IR::OP_VFNMLASCALARINSERT:
+      case FEXCore::IR::OP_VFNMLSSCALARINSERT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFMLAScalarInsert>();
+        std::string VU = LoadFPROperand(Op->Upper);
+        std::string V1 = LoadFPROperand(Op->Vector1);
+        std::string V2 = LoadFPROperand(Op->Vector2);
+        std::string VA = LoadFPROperand(Op->Addend);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        bool NegProd = (IROp->Op == FEXCore::IR::OP_VFNMLASCALARINSERT || IROp->Op == FEXCore::IR::OP_VFNMLSSCALARINSERT);
+        bool NegAdd  = (IROp->Op == FEXCore::IR::OP_VFMLSSCALARINSERT  || IROp->Op == FEXCore::IR::OP_VFNMLSSCALARINSERT);
+        const char* VecTy = (ElemBits == 64) ? "<2 x double>" : "<4 x float>";
+        const char* ScTy  = (ElemBits == 64) ? "double" : "float";
+        const char* Intr  = (ElemBits == 64) ? "@llvm.fma.f64" : "@llvm.fma.f32";
+        std::string BCU = NextVal(), BC1 = NextVal(), BC2 = NextVal(), BCA = NextVal();
+        std::string E1 = NextVal(), E2 = NextVal(), EA = NextVal();
+        OS << "  " << BCU << " = bitcast <2 x i64> " << VU << " to " << VecTy << "\n";
+        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to " << VecTy << "\n";
+        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to " << VecTy << "\n";
+        OS << "  " << BCA << " = bitcast <2 x i64> " << VA << " to " << VecTy << "\n";
+        OS << "  " << E1 << " = extractelement " << VecTy << " " << BC1 << ", i32 0\n";
+        OS << "  " << E2 << " = extractelement " << VecTy << " " << BC2 << ", i32 0\n";
+        OS << "  " << EA << " = extractelement " << VecTy << " " << BCA << ", i32 0\n";
+        if (NegProd) {
+          std::string N1 = NextVal();
+          OS << "  " << N1 << " = fneg " << ScTy << " " << E1 << "\n";
+          E1 = N1;
+        }
+        if (NegAdd) {
+          std::string NA = NextVal();
+          OS << "  " << NA << " = fneg " << ScTy << " " << EA << "\n";
+          EA = NA;
+        }
+        std::string Fma = NextVal(), Ins = NextVal(), Res = NextVal();
+        OS << "  " << Fma << " = call " << ScTy << " " << Intr << "(" << ScTy << " " << E1 << ", " << ScTy << " " << E2 << ", " << ScTy << " " << EA << ")\n";
+        OS << "  " << Ins << " = insertelement " << VecTy << " " << BCU << ", " << ScTy << " " << Fma << ", i32 0\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Ins << " to <2 x i64>\n";
         StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VFRSQRTSCALARINSERT:
+      case FEXCore::IR::OP_VFRECPSCALARINSERT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFRSqrtScalarInsert>();
+        std::string V1 = LoadFPROperand(Op->Vector1);
+        std::string V2 = LoadFPROperand(Op->Vector2);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        std::string BaseVec = Op->ZeroUpperBits ? "zeroinitializer" : V1;
+        bool IsRsqrt = (IROp->Op == FEXCore::IR::OP_VFRSQRT || IROp->Op == FEXCore::IR::OP_VFRSQRTSCALARINSERT);
+        const char* VecTy = (ElemBits == 64) ? "<2 x double>" : "<4 x float>";
+        const char* ScTy  = (ElemBits == 64) ? "double" : "float";
+        std::string BC2 = NextVal(), BCB = NextVal(), E2 = NextVal(), Den = E2, Div = NextVal(), Ins = NextVal(), Res = NextVal();
+        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to " << VecTy << "\n";
+        OS << "  " << BCB << " = bitcast <2 x i64> " << BaseVec << " to " << VecTy << "\n";
+        OS << "  " << E2 << " = extractelement " << VecTy << " " << BC2 << ", i32 0\n";
+        if (IsRsqrt) {
+          Den = NextVal();
+          OS << "  " << Den << " = call " << ScTy << " @llvm.sqrt." << (ElemBits == 64 ? "f64" : "f32") << "(" << ScTy << " " << E2 << ")\n";
+        }
+        OS << "  " << Div << " = fdiv " << ScTy << " 1.000000e+00, " << Den << "\n";
+        OS << "  " << Ins << " = insertelement " << VecTy << " " << BCB << ", " << ScTy << " " << Div << ", i32 0\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Ins << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VECTOR_FTOI:
+      case FEXCore::IR::OP_VECTOR_FTOISIZED: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Vector_FToI>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        const char* Intr = "nearbyint";
+        if (IROp->Op == FEXCore::IR::OP_VECTOR_FTOI) {
+          switch (Op->Round) {
+          case FEXCore::IR::RoundMode::Nearest: Intr = "nearbyint"; break;
+          case FEXCore::IR::RoundMode::NegInfinity: Intr = "floor"; break;
+          case FEXCore::IR::RoundMode::PosInfinity: Intr = "ceil"; break;
+          case FEXCore::IR::RoundMode::TowardsZero: Intr = "trunc"; break;
+          case FEXCore::IR::RoundMode::Host: Intr = "rint"; break;
+          }
+        } else {
+          auto* OpS = IROp->C<FEXCore::IR::IROp_Vector_FToISized>();
+          Intr = OpS->HostRound ? "rint" : "trunc";
+        }
+        std::string BC = NextVal(), Rnd = NextVal(), Res = NextVal();
+        if (ElemBits == 64) {
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <2 x double>\n";
+          OS << "  " << Rnd << " = call <2 x double> @llvm." << Intr << ".v2f64(<2 x double> " << BC << ")\n";
+          OS << "  " << Res << " = bitcast <2 x double> " << Rnd << " to <2 x i64>\n";
+        } else {
+          OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <4 x float>\n";
+          OS << "  " << Rnd << " = call <4 x float> @llvm." << Intr << ".v4f32(<4 x float> " << BC << ")\n";
+          OS << "  " << Res << " = bitcast <4 x float> " << Rnd << " to <2 x i64>\n";
+        }
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFTOISCALARINSERT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFToIScalarInsert>();
+        std::string V1 = LoadFPROperand(Op->Vector1);
+        std::string V2 = LoadFPROperand(Op->Vector2);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        std::string BaseVec = Op->ZeroUpperBits ? "zeroinitializer" : V1;
+        const char* Intr = "nearbyint";
+        switch (Op->Round) {
+        case FEXCore::IR::RoundMode::Nearest: Intr = "nearbyint"; break;
+        case FEXCore::IR::RoundMode::NegInfinity: Intr = "floor"; break;
+        case FEXCore::IR::RoundMode::PosInfinity: Intr = "ceil"; break;
+        case FEXCore::IR::RoundMode::TowardsZero: Intr = "trunc"; break;
+        case FEXCore::IR::RoundMode::Host: Intr = "rint"; break;
+        }
+        const char* VecTy = (ElemBits == 64) ? "<2 x double>" : "<4 x float>";
+        const char* ScTy  = (ElemBits == 64) ? "double" : "float";
+        const char* Suf   = (ElemBits == 64) ? "f64" : "f32";
+        std::string BC2 = NextVal(), BCB = NextVal(), E2 = NextVal(), Rnd = NextVal(), Ins = NextVal(), Res = NextVal();
+        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to " << VecTy << "\n";
+        OS << "  " << BCB << " = bitcast <2 x i64> " << BaseVec << " to " << VecTy << "\n";
+        OS << "  " << E2 << " = extractelement " << VecTy << " " << BC2 << ", i32 0\n";
+        OS << "  " << Rnd << " = call " << ScTy << " @llvm." << Intr << "." << Suf << "(" << ScTy << " " << E2 << ")\n";
+        OS << "  " << Ins << " = insertelement " << VecTy << " " << BCB << ", " << ScTy << " " << Rnd << ", i32 0\n";
+        OS << "  " << Res << " = bitcast " << VecTy << " " << Ins << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VECTOR_F64TOI32: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Vector_F64ToI32>();
+        std::string V = LoadFPROperand(Op->Vector);
+        const char* Intr = "trunc";
+        switch (Op->Round) {
+        case FEXCore::IR::RoundMode::Nearest: Intr = "nearbyint"; break;
+        case FEXCore::IR::RoundMode::NegInfinity: Intr = "floor"; break;
+        case FEXCore::IR::RoundMode::PosInfinity: Intr = "ceil"; break;
+        case FEXCore::IR::RoundMode::TowardsZero: Intr = "trunc"; break;
+        case FEXCore::IR::RoundMode::Host: Intr = "rint"; break;
+        }
+        std::string BC = NextVal(), Rnd = NextVal(), Res = NextVal();
+        OS << "  " << BC << " = bitcast <2 x i64> " << V << " to <2 x double>\n";
+        OS << "  " << Rnd << " = call <2 x double> @llvm." << Intr << ".v2f64(<2 x double> " << BC << ")\n";
+        OS << "  " << Res << " = call <2 x i64> asm \"fcvtzs $0.2d, $1.2d ; sqxtn $0.2s, $0.2d\", \"=w,w\"(<2 x double> " << Rnd << ")\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, 64));
+        break;
+      }
+
+      case FEXCore::IR::OP_VFCVTL2: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFCVTL2>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned DstBits = OpSizeToBits(IROp->ElementSize);
+        std::string Res = NextVal();
+        const char* Arr = (DstBits == 64) ? "2d, $1.4s" : "4s, $1.8h";
+        OS << "  " << Res << " = call <2 x i64> asm \"fcvtl2 $0." << Arr << "\", \"=w,w\"(<2 x i64> " << V << ")\n";
+        StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VFCVTN2: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VFCVTN2>();
+        std::string VL = LoadFPROperand(Op->VectorLower);
+        std::string VU = LoadFPROperand(Op->VectorUpper);
+        unsigned DstBits = OpSizeToBits(IROp->ElementSize);
+        std::string Res = NextVal();
+        const char* Arr = (DstBits == 32) ? "4s, $2.2d" : "8h, $2.4s";
+        OS << "  " << Res << " = call <2 x i64> asm \"mov $0.16b, $1.16b ; fcvtn2 $0." << Arr << "\", \"=&w,w,w\"(<2 x i64> " << VL << ", <2 x i64> " << VU << ")\n";
+        StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VSQXTN:
+      case FEXCore::IR::OP_VSQXTUN: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VSQXTN>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        const char* Mn = (IROp->Op == FEXCore::IR::OP_VSQXTUN) ? "sqxtun" : "sqxtn";
+        const char* Arr = (ElemBits == 8) ? "8b, $1.8h" : (ElemBits == 16) ? "4h, $1.4s" : "2s, $1.2d";
+        std::string Res = NextVal();
+        OS << "  " << Res << " = call <2 x i64> asm \"" << Mn << " $0." << Arr << "\", \"=w,w\"(<2 x i64> " << V << ")\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, 64));
+        break;
+      }
+
+      case FEXCore::IR::OP_VSQXTN2:
+      case FEXCore::IR::OP_VSQXTUN2: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VSQXTN2>();
+        std::string VL = LoadFPROperand(Op->VectorLower);
+        std::string VU = LoadFPROperand(Op->VectorUpper);
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        const char* Mn = (IROp->Op == FEXCore::IR::OP_VSQXTUN2) ? "sqxtun2" : "sqxtn2";
+        const char* Arr = (ElemBits == 8) ? "16b, $2.8h" : (ElemBits == 16) ? "8h, $2.4s" : "4s, $2.2d";
+        std::string Res = NextVal();
+        OS << "  " << Res << " = call <2 x i64> asm \"mov $0.16b, $1.16b ; " << Mn << " $0." << Arr << "\", \"=&w,w,w\"(<2 x i64> " << VL << ", <2 x i64> " << VU << ")\n";
+        StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VUSHRNI: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VUShrNI>();
+        std::string V = LoadFPROperand(Op->Vector);
+        unsigned DstBits = OpSizeToBits(IROp->ElementSize);
+        if ( DstBits != 8 && DstBits != 16 && DstBits != 32 ) DstBits = 16;
+        unsigned SrcBits = DstBits * 2;
+        unsigned Lanes = 128 / SrcBits;
+        unsigned Sh = (Op->BitShift >= SrcBits) ? (SrcBits - 1) : Op->BitShift;
+        std::string SrcVecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(SrcBits) + ">";
+        std::string DstHalfTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(DstBits) + ">";
+        std::string BC = NextVal(), Shifted = BC, Tr = NextVal(), Z64 = NextVal(), Res = NextVal();
+        OS << "  " << BC << " = bitcast <2 x i64> " << V << " to " << SrcVecTy << "\n";
+        if (Sh > 0) {
+          Shifted = NextVal();
+          std::string ShVec = "<";
+          for (unsigned i = 0; i < Lanes; ++i) {
+            if (i) ShVec += ", ";
+            ShVec += "i" + std::to_string(SrcBits) + " " + std::to_string(Sh);
+          }
+          ShVec += ">";
+          OS << "  " << Shifted << " = lshr " << SrcVecTy << " " << BC << ", " << ShVec << "\n";
+        }
+        OS << "  " << Tr << " = trunc " << SrcVecTy << " " << Shifted << " to " << DstHalfTy << "\n";
+        OS << "  " << Z64 << " = bitcast " << DstHalfTy << " " << Tr << " to i64\n";
+        OS << "  " << Res << " = insertelement <2 x i64> zeroinitializer, i64 " << Z64 << ", i32 0\n";
+        StoreFPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_VSSHLL:
+      case FEXCore::IR::OP_VSSHLL2: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VSSHLL>();
+        bool HighHalf = (IROp->Op == FEXCore::IR::OP_VSSHLL2);
+        unsigned DstBits = OpSizeToBits(IROp->ElementSize);
+        if (DstBits != 16 && DstBits != 32 && DstBits != 64) DstBits = 32;
+        std::string Ext = Rellume.LiftSsePmovx(LoadFPROperand(Op->Vector), DstBits, true, HighHalf);
+        if (Op->BitShift > 0) {
+          unsigned Lanes = 128 / DstBits;
+          std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(DstBits) + ">";
+          std::string ShVec = "<";
+          for (unsigned i = 0; i < Lanes; ++i) {
+            if (i) ShVec += ", ";
+            ShVec += "i" + std::to_string(DstBits) + " " + std::to_string(Op->BitShift);
+          }
+          ShVec += ">";
+          std::string BC = NextVal(), Sh = NextVal(), Res = NextVal();
+          OS << "  " << BC << " = bitcast <2 x i64> " << Ext << " to " << VecTy << "\n";
+          OS << "  " << Sh << " = shl " << VecTy << " " << BC << ", " << ShVec << "\n";
+          OS << "  " << Res << " = bitcast " << VecTy << " " << Sh << " to <2 x i64>\n";
+          Ext = Res;
+        }
+        StoreFPRDest(CodeNode, Ext);
+        break;
+      }
+
+      case FEXCore::IR::OP_VSMULH: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VSMulH>();
+        std::string V1 = LoadFPROperand(Op->Vector1);
+        std::string V2 = LoadFPROperand(Op->Vector2);
+        std::string BC1 = NextVal(), BC2 = NextVal(), S1 = NextVal(), S2 = NextVal(), M = NextVal(), Sh = NextVal(), Tr = NextVal(), Res = NextVal();
+        OS << "  " << BC1 << " = bitcast <2 x i64> " << V1 << " to <8 x i16>\n";
+        OS << "  " << BC2 << " = bitcast <2 x i64> " << V2 << " to <8 x i16>\n";
+        OS << "  " << S1 << " = sext <8 x i16> " << BC1 << " to <8 x i32>\n";
+        OS << "  " << S2 << " = sext <8 x i16> " << BC2 << " to <8 x i32>\n";
+        OS << "  " << M << " = mul <8 x i32> " << S1 << ", " << S2 << "\n";
+        OS << "  " << Sh << " = lshr <8 x i32> " << M << ", <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>\n";
+        OS << "  " << Tr << " = trunc <8 x i32> " << Sh << " to <8 x i16>\n";
+        OS << "  " << Res << " = bitcast <8 x i16> " << Tr << " to <2 x i64>\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        break;
+      }
+
+      case FEXCore::IR::OP_VBROADCASTFROMMEM: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VBroadcastFromMem>();
+        std::string Addr = LoadGPROperand(Op->Address);
+        std::string Ptr = NextVal();
+        OS << "  " << Ptr << " = inttoptr i64 " << Addr << " to ptr\n";
+        unsigned ElemBits = OpSizeToBits(IROp->ElementSize);
+        if (ElemBits >= 128) {
+          std::string V = NextVal();
+          OS << "  " << V << " = load <2 x i64>, ptr " << Ptr << ", align 1\n";
+          StoreFPRDest(CodeNode, V);
+        } else {
+          if (ElemBits != 8 && ElemBits != 16 && ElemBits != 32 && ElemBits != 64) ElemBits = 32;
+          unsigned Lanes = 128 / ElemBits;
+          std::string VecTy = "<" + std::to_string(Lanes) + " x i" + std::to_string(ElemBits) + ">";
+          std::string Ld = NextVal(), Ins0 = NextVal(), Shuf = NextVal(), Res = NextVal();
+          OS << "  " << Ld << " = load i" << ElemBits << ", ptr " << Ptr << ", align 1\n";
+          OS << "  " << Ins0 << " = insertelement " << VecTy << " poison, i" << ElemBits << " " << Ld << ", i32 0\n";
+          OS << "  " << Shuf << " = shufflevector " << VecTy << " " << Ins0 << ", " << VecTy << " poison, <" << Lanes << " x i32> zeroinitializer\n";
+          OS << "  " << Res << " = bitcast " << VecTy << " " << Shuf << " to <2 x i64>\n";
+          StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
+        }
+        break;
+      }
+
+      case FEXCore::IR::OP_VLOADNONTEMPORAL: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VLoadNonTemporal>();
+        std::string Base = LoadGPROperand(Op->Addr);
+        std::string Addr = NextVal(), Ptr = NextVal(), Vec = NextVal();
+        OS << "  " << Addr << " = add i64 " << Base << ", " << static_cast<int64_t>(Op->Offset) << "\n";
+        OS << "  " << Ptr << " = inttoptr i64 " << Addr << " to ptr\n";
+        OS << "  " << Vec << " = load <2 x i64>, ptr " << Ptr << ", align 1\n";
+        StoreFPRDest(CodeNode, Vec);
+        break;
+      }
+
+      case FEXCore::IR::OP_VSTORENONTEMPORAL: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VStoreNonTemporal>();
+        std::string Base = LoadGPROperand(Op->Addr);
+        std::string Vec = LoadFPROperand(Op->Value);
+        std::string Addr = NextVal(), Ptr = NextVal();
+        OS << "  " << Addr << " = add i64 " << Base << ", " << static_cast<int64_t>(Op->Offset) << "\n";
+        OS << "  " << Ptr << " = inttoptr i64 " << Addr << " to ptr\n";
+        OS << "  store <2 x i64> " << Vec << ", ptr " << Ptr << ", align 1\n";
+        break;
+      }
+
+      case FEXCore::IR::OP_VSTORENONTEMPORALPAIR: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_VStoreNonTemporalPair>();
+        std::string Base = LoadGPROperand(Op->Addr);
+        std::string V1 = LoadFPROperand(Op->ValueLow);
+        std::string V2 = LoadFPROperand(Op->ValueHigh);
+        std::string Addr1 = NextVal(), Addr2 = NextVal(), Ptr1 = NextVal(), Ptr2 = NextVal();
+        OS << "  " << Addr1 << " = add i64 " << Base << ", " << static_cast<int64_t>(Op->Offset) << "\n";
+        OS << "  " << Addr2 << " = add i64 " << Addr1 << ", 16\n";
+        OS << "  " << Ptr1 << " = inttoptr i64 " << Addr1 << " to ptr\n";
+        OS << "  " << Ptr2 << " = inttoptr i64 " << Addr2 << " to ptr\n";
+        OS << "  store <2 x i64> " << V1 << ", ptr " << Ptr1 << ", align 1\n";
+        OS << "  store <2 x i64> " << V2 << ", ptr " << Ptr2 << ", align 1\n";
+        break;
+      }
+
+      case FEXCore::IR::OP_POPCOUNT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Popcount>();
+        std::string Src = MaskToOpSize(LoadGPROperand(Op->Src), OpSize);
+        std::string Res = NextVal();
+        OS << "  " << Res << " = call i64 @llvm.ctpop.i64(i64 " << Src << ")\n";
+        StoreGPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_FINDLSB: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_FindLSB>();
+        std::string Src = MaskToOpSize(LoadGPROperand(Op->Src), OpSize);
+        std::string Res = NextVal();
+        OS << "  " << Res << " = call i64 @llvm.cttz.i64(i64 " << Src << ", i1 false)\n";
+        StoreGPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_COUNTLEADINGZEROES: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_CountLeadingZeroes>();
+        std::string Src = LoadGPROperand(Op->Src);
+        unsigned OpBits = (Bits <= 64 && Bits >= 16) ? Bits : 64;
+        if (OpBits < 64) {
+          std::string Tr = NextVal(), Clz = NextVal(), Z = NextVal();
+          OS << "  " << Tr << " = trunc i64 " << Src << " to i" << OpBits << "\n";
+          OS << "  " << Clz << " = call i" << OpBits << " @llvm.ctlz.i" << OpBits << "(i" << OpBits << " " << Tr << ", i1 false)\n";
+          OS << "  " << Z << " = zext i" << OpBits << " " << Clz << " to i64\n";
+          StoreGPRDest(CodeNode, Z);
+        } else {
+          std::string Clz = NextVal();
+          OS << "  " << Clz << " = call i64 @llvm.ctlz.i64(i64 " << Src << ", i1 false)\n";
+          StoreGPRDest(CodeNode, Clz);
+        }
+        break;
+      }
+
+      case FEXCore::IR::OP_RBIT: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_Rbit>();
+        std::string Src = LoadGPROperand(Op->Src);
+        if (Bits == 32) {
+          std::string Tr = NextVal(), Rb = NextVal(), Z = NextVal();
+          OS << "  " << Tr << " = trunc i64 " << Src << " to i32\n";
+          OS << "  " << Rb << " = call i32 @llvm.bitreverse.i32(i32 " << Tr << ")\n";
+          OS << "  " << Z << " = zext i32 " << Rb << " to i64\n";
+          StoreGPRDest(CodeNode, Z);
+        } else {
+          std::string Rb = NextVal();
+          OS << "  " << Rb << " = call i64 @llvm.bitreverse.i64(i64 " << Src << ")\n";
+          StoreGPRDest(CodeNode, Rb);
+        }
+        break;
+      }
+
+      case FEXCore::IR::OP_MASKGENERATEFROMBITWIDTH: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_MaskGenerateFromBitWidth>();
+        std::string BW = LoadGPROperand(Op->BitWidth);
+        std::string IsZero = NextVal(), Sh = NextVal(), Inv = NextVal(), Res = NextVal();
+        OS << "  " << IsZero << " = icmp eq i64 " << BW << ", 0\n";
+        OS << "  " << Sh << " = shl i64 -1, " << BW << "\n";
+        OS << "  " << Inv << " = xor i64 " << Sh << ", -1\n";
+        OS << "  " << Res << " = select i1 " << IsZero << ", i64 0, i64 " << Inv << "\n";
+        StoreGPRDest(CodeNode, Res);
+        break;
+      }
+
+      case FEXCore::IR::OP_NZCVSELECTV: {
+        auto* Op = IROp->C<FEXCore::IR::IROp_NZCVSelectV>();
+        std::string CondBit = EvaluateNZCVCond(Op->Cond);
+        UnconsumedNonRspFlags = false;
+        std::string TV = LoadFPROperand(Op->TrueVal);
+        std::string FV = LoadFPROperand(Op->FalseVal);
+        std::string Sel = NextVal();
+        OS << "  " << Sel << " = select i1 " << CondBit << ", <2 x i64> " << TV << ", <2 x i64> " << FV << "\n";
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Sel, OpSizeToBits(IROp->ElementSize)));
+        break;
+      }
+
+      case FEXCore::IR::OP_FENCE:
+      case FEXCore::IR::OP_YIELD:
+      case FEXCore::IR::OP_CACHELINECLEAR:
+      case FEXCore::IR::OP_CACHELINECLEAN:
+      case FEXCore::IR::OP_CACHELINEZERO: {
+        OS << "  fence seq_cst\n";
         break;
       }
 
@@ -3446,7 +4441,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
         OS << "  " << TPart << " = and <2 x i64> " << VT << ", " << VM << "\n";
         OS << "  " << FPart << " = and <2 x i64> " << VF << ", " << NotM << "\n";
         OS << "  " << Res << " = or <2 x i64> " << TPart << ", " << FPart << "\n";
-        StoreFPRDest(CodeNode, Res);
+        StoreFPRDest(CodeNode, ZeroUpperFPRBits(Res, Bits));
         break;
       }
 
@@ -3581,6 +4576,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
       }
 
       default: {
+        Result.HasUnhandledIR = true;
         if (getenv("FEX_DUMP_UNHANDLED_OPS")) {
           fprintf(stderr, "UNHANDLED_OP: %u (%s) in 0x%llx\n",
                   static_cast<unsigned>(IROp->Op),

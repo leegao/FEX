@@ -4,10 +4,20 @@
 #include <stdarg.h>
 #include <math.h>
 
-long __isoc23_strtol(const char *nptr, char **endptr, int base) { return strtol(nptr, endptr, base); }
-unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) { return strtoul(nptr, endptr, base); }
-long long __isoc23_strtoll(const char *nptr, char **endptr, int base) { return strtoll(nptr, endptr, base); }
-unsigned long long __isoc23_strtoull(const char *nptr, char **endptr, int base) { return strtoull(nptr, endptr, base); }
+#undef strtol
+#undef strtoul
+#undef strtoll
+#undef strtoull
+
+extern long __strtol_internal(const char *, char **, int, int);
+extern unsigned long __strtoul_internal(const char *, char **, int, int);
+extern long long __strtoll_internal(const char *, char **, int, int);
+extern unsigned long long __strtoull_internal(const char *, char **, int, int);
+
+long __isoc23_strtol(const char *nptr, char **endptr, int base) { return __strtol_internal(nptr, endptr, base, 0); }
+unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) { return __strtoul_internal(nptr, endptr, base, 0); }
+long long __isoc23_strtoll(const char *nptr, char **endptr, int base) { return __strtoll_internal(nptr, endptr, base, 0); }
+unsigned long long __isoc23_strtoull(const char *nptr, char **endptr, int base) { return __strtoull_internal(nptr, endptr, base, 0); }
 int __isoc23_sscanf(const char *str, const char *format, ...) {
     va_list ap; va_start(ap, format); int r = vsscanf(str, format, ap); va_end(ap); return r;
 }

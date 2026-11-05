@@ -200,7 +200,39 @@ inline void EmitIntrinsicDeclarations(std::ostringstream& ModIR) {
   ModIR << "declare i16 @llvm.vector.reduce.add.v8i16(<8 x i16>)\n";
   ModIR << "declare i8  @llvm.vector.reduce.add.v16i8(<16 x i8>)\n";
   ModIR << "declare <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8>, <16 x i8>)\n";
-  ModIR << "declare <16 x i8> @llvm.aarch64.neon.tbl2.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)\n\n";
+  ModIR << "declare <16 x i8> @llvm.aarch64.neon.tbl2.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)\n";
+  ModIR << "declare <16 x i8> @llvm.aarch64.neon.tbx1.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)\n";
+  ModIR << "declare <16 x i8> @llvm.ctpop.v16i8(<16 x i8>)\n";
+  ModIR << "declare float  @llvm.fabs.f32(float)\n";
+  ModIR << "declare double @llvm.fabs.f64(double)\n";
+  ModIR << "declare <4 x float>  @llvm.fabs.v4f32(<4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.fabs.v2f64(<2 x double>)\n";
+  ModIR << "declare <4 x float>  @llvm.copysign.v4f32(<4 x float>, <4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.copysign.v2f64(<2 x double>, <2 x double>)\n";
+  ModIR << "declare float  @llvm.fma.f32(float, float, float)\n";
+  ModIR << "declare double @llvm.fma.f64(double, double, double)\n";
+  ModIR << "declare <4 x float>  @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.fma.v2f64(<2 x double>, <2 x double>, <2 x double>)\n";
+  ModIR << "declare float  @llvm.rint.f32(float)\n";
+  ModIR << "declare double @llvm.rint.f64(double)\n";
+  ModIR << "declare <4 x float>  @llvm.rint.v4f32(<4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.rint.v2f64(<2 x double>)\n";
+  ModIR << "declare float  @llvm.nearbyint.f32(float)\n";
+  ModIR << "declare double @llvm.nearbyint.f64(double)\n";
+  ModIR << "declare <4 x float>  @llvm.nearbyint.v4f32(<4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.nearbyint.v2f64(<2 x double>)\n";
+  ModIR << "declare float  @llvm.floor.f32(float)\n";
+  ModIR << "declare double @llvm.floor.f64(double)\n";
+  ModIR << "declare <4 x float>  @llvm.floor.v4f32(<4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.floor.v2f64(<2 x double>)\n";
+  ModIR << "declare float  @llvm.ceil.f32(float)\n";
+  ModIR << "declare double @llvm.ceil.f64(double)\n";
+  ModIR << "declare <4 x float>  @llvm.ceil.v4f32(<4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.ceil.v2f64(<2 x double>)\n";
+  ModIR << "declare float  @llvm.trunc.f32(float)\n";
+  ModIR << "declare double @llvm.trunc.f64(double)\n";
+  ModIR << "declare <4 x float>  @llvm.trunc.v4f32(<4 x float>)\n";
+  ModIR << "declare <2 x double> @llvm.trunc.v2f64(<2 x double>)\n\n";
 }
 
 class Lifter {
@@ -487,7 +519,7 @@ public:
 
   // Rellume LiftSseUnpck (src/x86-64/lifter-sse.cc:308-331) for VZIP / VZIP2 / VUNZIP / VUNZIP2
   std::string LiftSseUnpck(const std::string& V1_64x2, const std::string& V2_64x2,
-                           unsigned ElemBits, bool HighHalf, bool IsDeinterleave) {
+                           unsigned ElemBits, bool HighHalf, bool IsDeinterleave, unsigned OpBits = 128) {
     Facet F = ResolveVecIntFacet(ElemBits);
     unsigned Lanes = FacetLanes(F);
     std::string Op1 = CastVecFromI64x2(V1_64x2, F);
@@ -495,16 +527,25 @@ public:
     std::string Ty = FacetTypeStr(F);
     std::string MaskTy = "<" + std::to_string(Lanes) + " x i32>";
     std::string Mask = "<";
+    unsigned ActiveLanes = (OpBits == 64 && Lanes >= 2) ? (Lanes / 2) : Lanes;
     for (unsigned i = 0; i < Lanes; ++i) {
       if (i) Mask += ", ";
       unsigned Idx = 0;
       if (!IsDeinterleave) {
-        // Interleave (ZIP / PUNPCKL / PUNPCKH)
-        unsigned Pair = (HighHalf ? (Lanes / 2) : 0) + (i / 2);
+        unsigned Pair = (HighHalf ? (ActiveLanes / 2) : 0) + (i / 2);
         Idx = (i & 1) ? (Lanes + Pair) : Pair;
       } else {
-        // Deinterleave (UNZIP / UNZIP2)
-        Idx = 2 * i + (HighHalf ? 1 : 0);
+        if (OpBits == 64 && Lanes >= 2) {
+          if (i < ActiveLanes / 2) {
+            Idx = 2 * i + (HighHalf ? 1 : 0);
+          } else if (i < ActiveLanes) {
+            Idx = Lanes + 2 * (i - ActiveLanes / 2) + (HighHalf ? 1 : 0);
+          } else {
+            Idx = 0;
+          }
+        } else {
+          Idx = 2 * i + (HighHalf ? 1 : 0);
+        }
       }
       Mask += "i32 " + std::to_string(Idx);
     }
@@ -512,7 +553,13 @@ public:
     std::string Shuf = NextVal();
     OS << "  " << Shuf << " = shufflevector " << Ty << " " << Op1 << ", " << Ty << " " << Op2
        << ", " << MaskTy << " " << Mask << "\n";
-    return CastVecToI64x2(Shuf, F);
+    std::string Res64x2 = CastVecToI64x2(Shuf, F);
+    if (OpBits == 64) {
+      std::string ZeroHi = NextVal();
+      OS << "  " << ZeroHi << " = insertelement <2 x i64> " << Res64x2 << ", i64 0, i32 1\n";
+      return ZeroHi;
+    }
+    return Res64x2;
   }
 
   // Rellume LiftSsePshiftElement (src/x86-64/lifter-sse.cc:356-389)
@@ -596,27 +643,58 @@ public:
     return CastVecToI64x2(Sel, F);
   }
 
-  // Rellume LiftSsePalignr (src/x86-64/lifter-sse.cc:403-427)
-  std::string LiftSsePalignr(const std::string& V1_64x2, const std::string& V2_64x2, unsigned ImmBytes) {
-    if (ImmBytes == 0) return V2_64x2;
-    if (ImmBytes == 16) return V1_64x2;
-    if (ImmBytes >= 32) return "zeroinitializer";
-    std::string S1 = CastVecFromI64x2(V1_64x2, Facet::V16I8);
-    std::string S2 = CastVecFromI64x2(V2_64x2, Facet::V16I8);
-    if (ImmBytes > 16) {
-      S2 = S1;
-      S1 = "zeroinitializer";
+  // Rellume LiftSsePalignr / FEX VExtr (VectorOps.cpp:3173-3219):
+  // LowerBits = Op->VectorUpper (Vn, bytes 0..OpBytes-1)
+  // UpperBits = Op->VectorLower (Vm, bytes OpBytes..2*OpBytes-1)
+  std::string LiftSsePalignr(const std::string& LowerBits_64x2, const std::string& UpperBits_64x2,
+                             unsigned Index, unsigned ElemBytes = 1, unsigned OpBytes = 16) {
+    if (ElemBytes == 0) ElemBytes = 1;
+    if (OpBytes != 8) OpBytes = 16;
+    std::string LoVec = LowerBits_64x2;
+    std::string HiVec = UpperBits_64x2;
+    if (Index >= OpBytes) {
+      LoVec = HiVec;
+      HiVec = "zeroinitializer";
+      Index -= OpBytes;
     }
-    std::string Mask = "<";
-    for (unsigned i = 0; i < 16; ++i) {
-      if (i) Mask += ", ";
-      Mask += "i32 " + std::to_string(i + (ImmBytes & 0xF));
+    unsigned CopyFromByte = (Index * ElemBytes) & (OpBytes - 1);
+    if (OpBytes == 16) {
+      if (CopyFromByte == 0) return LoVec;
+      std::string SLo = CastVecFromI64x2(LoVec, Facet::V16I8);
+      std::string SHi = CastVecFromI64x2(HiVec, Facet::V16I8);
+      std::string Mask = "<";
+      for (unsigned i = 0; i < 16; ++i) {
+        if (i) Mask += ", ";
+        Mask += "i32 " + std::to_string(CopyFromByte + i);
+      }
+      Mask += ">";
+      std::string Shuf = NextVal();
+      OS << "  " << Shuf << " = shufflevector <16 x i8> " << SLo << ", <16 x i8> " << SHi
+         << ", <16 x i32> " << Mask << "\n";
+      return CastVecToI64x2(Shuf, Facet::V16I8);
+    } else {
+      std::string SLo = CastVecFromI64x2(LoVec, Facet::V16I8);
+      std::string SHi = CastVecFromI64x2(HiVec, Facet::V16I8);
+      std::string Mask = "<";
+      for (unsigned i = 0; i < 16; ++i) {
+        if (i) Mask += ", ";
+        if (i < 8) {
+          unsigned b = CopyFromByte + i;
+          unsigned srcIdx = (b < 8) ? b : (16 + (b - 8));
+          Mask += "i32 " + std::to_string(srcIdx);
+        } else {
+          Mask += "i32 0";
+        }
+      }
+      Mask += ">";
+      std::string Shuf = NextVal();
+      OS << "  " << Shuf << " = shufflevector <16 x i8> " << SLo << ", <16 x i8> " << SHi
+         << ", <16 x i32> " << Mask << "\n";
+      std::string Res64x2 = CastVecToI64x2(Shuf, Facet::V16I8);
+      std::string ZeroHi = NextVal();
+      OS << "  " << ZeroHi << " = insertelement <2 x i64> " << Res64x2 << ", i64 0, i32 1\n";
+      return ZeroHi;
     }
-    Mask += ">";
-    std::string Shuf = NextVal();
-    OS << "  " << Shuf << " = shufflevector <16 x i8> " << S2 << ", <16 x i8> " << S1
-       << ", <16 x i32> " << Mask << "\n";
-    return CastVecToI64x2(Shuf, Facet::V16I8);
   }
 
 private:

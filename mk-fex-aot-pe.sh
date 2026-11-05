@@ -107,7 +107,7 @@ INCLUDE_STR="$(printf '%s ' "${INCLUDES[@]}")"
 PRESERVE_ALL_DEFS="-DFEXCORE_PRESERVE_ALL_ATTR= -DFEXCORE_HAS_PRESERVE_ALL_ATTR=0 -DFEX_PRESERVE_ALL_ATTR= -DFEX_HAS_PRESERVE_ALL_ATTR=0"
 SOFTFLOAT_DEFS=(-DINLINE='static inline' -DINLINE_LEVEL=4 -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_FAST_DIV32TO16=1 -DSOFTFLOAT_FAST_DIV64TO32=1)
 
-CMAKE_COMMON_FLAGS="-O2 ${LLVM_CFLAGS} ${ARCH_FLAGS} ${EC_DEFINE} ${INCLUDE_STR}"
+CMAKE_COMMON_FLAGS="-O2 -fno-omit-frame-pointer ${LLVM_CFLAGS} ${ARCH_FLAGS} ${EC_DEFINE} ${INCLUDE_STR}"
 CMAKE_C_FLAGS_VAL="${CMAKE_COMMON_FLAGS} -fwrapv"
 CMAKE_CXX_FLAGS_VAL="${CMAKE_COMMON_FLAGS} -std=c++20 -fpermissive -fno-exceptions -fwrapv"
 
@@ -287,11 +287,17 @@ c_sources = [os.path.join(root_dir, "External/xxhash/xxhash.c")]
 c_sources.extend(glob.glob(os.path.join(root_dir, "External/cephes/src/128bit/*.c")))
 sf_sources = [p for p in glob.glob(os.path.join(root_dir, "External/SoftFloat-3e/src/*.c")) if os.path.basename(p) not in ("f128_mulAdd.c", "f128_to_ui32.c", "s_normSubnormalF128SigM.c", "f128_to_f16.c")]
 
+hdr_mtime = max(
+    os.path.getmtime(os.path.join(root_dir, "FEXCore/include/FEXCore/Core/LLVMArm64ECAOT.h")),
+    os.path.getmtime(os.path.join(root_dir, "FEXCore/Source/Interface/Core/AOT/RellumeLifter.h")),
+    os.path.getmtime(os.path.join(root_dir, "FEXCore/include/FEXCore/Utils/LongJump.h")),
+)
+
 def compile_one(src, is_cpp, is_sf=False):
     rel = os.path.relpath(src, root_dir)
     h = hashlib.md5(rel.encode()).hexdigest()[:8]
     obj = os.path.join(obj_dir, f"{os.path.basename(src)}_{h}.o")
-    if os.path.exists(obj) and os.path.getmtime(obj) >= max(os.path.getmtime(src), os.path.getmtime(os.path.join(root_dir, "FEXCore/include/FEXCore/Core/LLVMArm64ECAOT.h"))):
+    if os.path.exists(obj) and os.path.getmtime(obj) >= max(os.path.getmtime(src), hdr_mtime):
         return obj
     if is_sf:
         cmd = f"{gcc} -std=gnu89 -w {c_flags} -DINLINE='static inline' -DINLINE_LEVEL=4 -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_FAST_DIV32TO16=1 -DSOFTFLOAT_FAST_DIV64TO32=1 -c '{src}' -o '{obj}'"
