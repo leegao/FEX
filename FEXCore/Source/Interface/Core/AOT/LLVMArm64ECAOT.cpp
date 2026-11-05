@@ -630,7 +630,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
   }
 
   // Bind live-in registers at function entry:
-  if (IsArm64ECNative && !Result.Safety.ReadsFlagsIn) {
+  if (!Result.Safety.ReadsFlagsIn) {
     OS << "  %sra_in = call %SRAStateEC asm \"\", "
           "\"={x8},={x0},={x1},={x27},={x23},={fp},={x25},={x26},={x2},={x3},={x4},={x5},={x19},={x20},={x21},={x22},={x17},={x28}\"()\n";
     for (int i = 0; i < 16; ++i) {
@@ -705,8 +705,28 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
     }
     if (OpHdr->Op == FEXCore::IR::OP_INLINEENTRYPOINTOFFSET) {
       auto* OffOp = OpHdr->C<FEXCore::IR::IROp_InlineEntrypointOffset>();
+      std::string BaseVa = "%runtime_entry_va";
+      if (Result.BasicBlockCount <= 128) {
+        const uint32_t InlineHdrOff = static_cast<uint32_t>(offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
+        const uint32_t TailRipOff = static_cast<uint32_t>(offsetof(FEXCore::CPU::CPUBackend::JITCodeTail, RIP));
+        std::string StVal = NextVal(), HSlotAddr = NextVal(), HSlotPtr = NextVal(), HPtrInt = NextVal();
+        std::string HPtr = NextVal(), TOff32 = NextVal(), TOff64 = NextVal(), TRipAddr = NextVal();
+        std::string TRipAddr2 = NextVal(), TRipPtr = NextVal(), Reva = NextVal();
+        OS << "  " << StVal << " = call i64 asm sideeffect \"\", \"={x28}\"()\n";
+        OS << "  " << HSlotAddr << " = add i64 " << StVal << ", " << InlineHdrOff << "\n";
+        OS << "  " << HSlotPtr << " = inttoptr i64 " << HSlotAddr << " to ptr\n";
+        OS << "  " << HPtrInt << " = load i64, ptr " << HSlotPtr << ", align 8\n";
+        OS << "  " << HPtr << " = inttoptr i64 " << HPtrInt << " to ptr\n";
+        OS << "  " << TOff32 << " = load i32, ptr " << HPtr << ", align 4\n";
+        OS << "  " << TOff64 << " = zext i32 " << TOff32 << " to i64\n";
+        OS << "  " << TRipAddr << " = add i64 " << HPtrInt << ", " << TOff64 << "\n";
+        OS << "  " << TRipAddr2 << " = add i64 " << TRipAddr << ", " << TailRipOff << "\n";
+        OS << "  " << TRipPtr << " = inttoptr i64 " << TRipAddr2 << " to ptr\n";
+        OS << "  " << Reva << " = load i64, ptr " << TRipPtr << ", align 8\n";
+        BaseVa = Reva;
+      }
       std::string Val = NextVal();
-      OS << "  " << Val << " = add i64 %runtime_entry_va, " << static_cast<int64_t>(OffOp->Offset) << "\n";
+      OS << "  " << Val << " = add i64 " << BaseVa << ", " << static_cast<int64_t>(OffOp->Offset) << "\n";
       if (OpHdr->Size == FEXCore::IR::OpSize::i32Bit) {
         std::string Masked = NextVal();
         OS << "  " << Masked << " = and i64 " << Val << ", 4294967295\n";
@@ -902,7 +922,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
   (void)FirstBlockNode;
   uint32_t FirstBlockId = FirstBlockHdr->CW<FEXCore::IR::IROp_CodeBlock>()->ID;
 
-  if (UsesEntrypointOffset) {
+  if (UsesEntrypointOffset && Result.BasicBlockCount > 128) {
     const uint32_t InlineHdrOff = static_cast<uint32_t>(offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
     const uint32_t TailRipOff = static_cast<uint32_t>(offsetof(FEXCore::CPU::CPUBackend::JITCodeTail, RIP));
     OS << "  %hdr_slot_addr = add i64 %state_ptr_int, " << InlineHdrOff << "\n";
@@ -923,6 +943,7 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
     OS << "bb_" << BlockIROp->ID << ":\n";
     bool BlockTerminated = false;
     bool UnconsumedNonRspFlags = false;
+    uint32_t ByteLoadsInBB = 0;
 
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       if (BlockTerminated) break;
@@ -952,8 +973,28 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
 
       case FEXCore::IR::OP_ENTRYPOINTOFFSET: {
         auto* Op = IROp->C<FEXCore::IR::IROp_EntrypointOffset>();
+        std::string BaseVa = "%runtime_entry_va";
+        if (Result.BasicBlockCount <= 128) {
+          const uint32_t InlineHdrOff = static_cast<uint32_t>(offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
+          const uint32_t TailRipOff = static_cast<uint32_t>(offsetof(FEXCore::CPU::CPUBackend::JITCodeTail, RIP));
+          std::string StVal = NextVal(), HSlotAddr = NextVal(), HSlotPtr = NextVal(), HPtrInt = NextVal();
+          std::string HPtr = NextVal(), TOff32 = NextVal(), TOff64 = NextVal(), TRipAddr = NextVal();
+          std::string TRipAddr2 = NextVal(), TRipPtr = NextVal(), Reva = NextVal();
+          OS << "  " << StVal << " = call i64 asm sideeffect \"\", \"={x28}\"()\n";
+          OS << "  " << HSlotAddr << " = add i64 " << StVal << ", " << InlineHdrOff << "\n";
+          OS << "  " << HSlotPtr << " = inttoptr i64 " << HSlotAddr << " to ptr\n";
+          OS << "  " << HPtrInt << " = load i64, ptr " << HSlotPtr << ", align 8\n";
+          OS << "  " << HPtr << " = inttoptr i64 " << HPtrInt << " to ptr\n";
+          OS << "  " << TOff32 << " = load i32, ptr " << HPtr << ", align 4\n";
+          OS << "  " << TOff64 << " = zext i32 " << TOff32 << " to i64\n";
+          OS << "  " << TRipAddr << " = add i64 " << HPtrInt << ", " << TOff64 << "\n";
+          OS << "  " << TRipAddr2 << " = add i64 " << TRipAddr << ", " << TailRipOff << "\n";
+          OS << "  " << TRipPtr << " = inttoptr i64 " << TRipAddr2 << " to ptr\n";
+          OS << "  " << Reva << " = load i64, ptr " << TRipPtr << ", align 8\n";
+          BaseVa = Reva;
+        }
         std::string Val = NextVal();
-        OS << "  " << Val << " = add i64 %runtime_entry_va, " << static_cast<int64_t>(Op->Offset) << "\n";
+        OS << "  " << Val << " = add i64 " << BaseVa << ", " << static_cast<int64_t>(Op->Offset) << "\n";
         StoreGPRDest(CodeNode, MaskToOpSize(Val, OpSize));
         break;
       }
@@ -1140,6 +1181,11 @@ LLVMArm64ECAOTCompiler::LiftIRToLLVM(uint64_t GuestEntryVA, uint64_t GuestSize, 
             std::string Z = NextVal();
             OS << "  " << Z << " = zext i" << LoadBits << " " << V << " to i64\n";
             V = Z;
+            if (LoadBits == 8 && Result.BasicBlockCount <= 128 && ++ByteLoadsInBB >= 1) {
+              std::string Bar = NextVal();
+              OS << "  " << Bar << " = call i64 asm sideeffect \"\", \"=r,0\"(i64 " << V << ")\n";
+              V = Bar;
+            }
           }
           StoreGPRDest(CodeNode, V);
         } else if (UsesFPR) {
@@ -3178,7 +3224,8 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
 
   std::ostringstream ModIR;
   ModIR << "target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32\"\n";
-  ModIR << "target triple = \"" << Opts.TargetTriple << "\"\n\n";
+  const std::string CodegenTriple = "aarch64-pc-windows-msvc";
+  ModIR << "target triple = \"" << CodegenTriple << "\"\n\n";
   ModIR << "%SRAState = type { i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64 }\n%SRAStateEC = type { i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64 }\n";
   ModIR << "%SRAFPRState = type { <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, "
            "<2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64>, <2 x i64> }\n\n";
@@ -3190,16 +3237,7 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
 
   // Emit representative Arm64EC external call signatures so LLVM's AArch64Arm64ECCallLowering
   // generates standard Arm64EC entry and exit thunks ($ientry_thunk$cdecl$..., $iexit_thunk$cdecl$...)
-  if (Opts.EmitArm64ECThunks) {
-    ModIR << "declare i64 @arm64ec_import_i64_i64_i64(i64, i64)\n";
-    ModIR << "declare void @arm64ec_import_void_ptr_u32(ptr, i32)\n";
-    ModIR << "define i64 @fex_arm64ec_interop_bridge(i64 %a, i64 %b, ptr %fn) {\n";
-    ModIR << "entry:\n";
-    ModIR << "  %r1 = call i64 @arm64ec_import_i64_i64_i64(i64 %a, i64 %b)\n";
-    ModIR << "  %r2 = call i64 %fn(i64 %r1, i64 %b)\n";
-    ModIR << "  ret i64 %r2\n";
-    ModIR << "}\n\n";
-  }
+  // Standard Arm64EC entry/exit thunks are emitted directly into OutThunks (.wowthk) below.
 
   // Attribute #0: FEX_SRA tier (.text_fex)
   // Attribute #1: ARM64EC_NATIVE tier (.text_ec)
@@ -3226,7 +3264,7 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
   }
 
   LLVMTargetRef Target = nullptr;
-  if (LLVMGetTargetFromTriple(Opts.TargetTriple.c_str(), &Target, &ErrMsg) != 0) {
+  if (LLVMGetTargetFromTriple(CodegenTriple.c_str(), &Target, &ErrMsg) != 0) {
     LogMan::Msg::EFmt("LLVMGetTargetFromTriple failed: {}", ErrMsg ? ErrMsg : "unknown");
     if (ErrMsg) LLVMDisposeMessage(ErrMsg);
     LLVMDisposeModule(Mod);
@@ -3235,7 +3273,7 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
   }
 
   LLVMTargetMachineRef TM = LLVMCreateTargetMachine(
-    Target, Opts.TargetTriple.c_str(), Opts.CpuArch.c_str(), "",
+    Target, CodegenTriple.c_str(), Opts.CpuArch.c_str(), "",
     LLVMCodeGenLevelAggressive, LLVMRelocPIC, LLVMCodeModelDefault);
 
   LLVMPassBuilderOptionsRef PBOpts = LLVMCreatePassBuilderOptions();
@@ -3407,6 +3445,33 @@ bool LLVMArm64ECAOTCompiler::CompileModuleBatch(const std::vector<LiftedFunction
   // 1. __fex_ec_to_sra_adapter: Synchronizes Arm64EC stack/registers and dispatches to FEX DispatcherLoopTop (0xB60)
   // 2. __fex_sra_to_ec_adapter: Synchronizes FEX SRA x23 -> sp and invokes target Arm64EC function in x11
   // 3. __os_arm64x_check_icall_cfg: Indirect call target validator for hybrid .text_ec / .text_fex targets
+  if (Opts.EmitArm64ECThunks) {
+    Arm64ECThunkRecord IEntry {};
+    IEntry.Name = "$ientry_thunk$cdecl$i8$i8i8";
+    IEntry.IsEntryThunk = true;
+    uint32_t EntryWords[4] = {
+      0xAA0803E0u, // mov x0, x8
+      0xAA1703FFu, // mov sp, x23
+      0xD63F0120u, // blr x9
+      0xD65F03C0u  // ret
+    };
+    IEntry.Bytes.resize(sizeof(EntryWords));
+    memcpy(IEntry.Bytes.data(), EntryWords, sizeof(EntryWords));
+    OutThunks.push_back(std::move(IEntry));
+
+    Arm64ECThunkRecord IExit {};
+    IExit.Name = "$iexit_thunk$cdecl$i8$i8i8";
+    IExit.IsEntryThunk = false;
+    uint32_t ExitWords[4] = {
+      0x910003F7u, // mov x23, sp
+      0xD63F0120u, // blr x9
+      0xAA0003E8u, // mov x8, x0
+      0xD65F03C0u  // ret
+    };
+    IExit.Bytes.resize(sizeof(ExitWords));
+    memcpy(IExit.Bytes.data(), ExitWords, sizeof(ExitWords));
+    OutThunks.push_back(std::move(IExit));
+  }
   {
     Arm64ECThunkRecord EcToSra {};
     EcToSra.Name = "__fex_ec_to_sra_adapter";
